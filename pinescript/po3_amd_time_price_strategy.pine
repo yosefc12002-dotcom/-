@@ -1,0 +1,360 @@
+// PO3 / Time + Price / AMD strategy for futures.
+// Implements: HTF candle lifecycle (Open -> Accumulation -> Manipulation -> Distribution),
+// Time+Price confluence gating, IFG/CISD entry confirmation, and stop/target trade management,
+// per the "PO3 / Time + Price / AMD Futures Trading Bot" strategy specification.
+//
+// State-machine mapping (spec section 3 -> this script):
+//   WAIT_FOR_HTF_OPEN / ACCUMULATION -> STATE_ACCUM
+//   MANIPULATION / CONFIRMED_REVERSAL / NO_TRADE (retry) -> STATE_MANIP
+//   ENTRY / DISTRIBUTION_MANAGE -> STATE_DONE (until strategy.exit closes the position;
+//     the next HTF open unconditionally resets to STATE_ACCUM, matching "on exit: go to WAIT_FOR_HTF_OPEN")
+//
+// This is a strategy specification for backtesting/education, not financial advice.
+// All parameters must be calibrated per-instrument before any sim/live use.
+//
+//@version=5
+strategy("PO3 / Time+Price / AMD Strategy", shorttitle = "PO3-AMD", overlay = true,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     initial_capital = 50000, currency = currency.USD,
+     max_bars_back = 5000, max_lines_count = 20, max_labels_count = 20,
+     calc_on_every_tick = false)
+
+// ============================================================================
+// CONFIGURATION PARAMETERS (spec section 1)
+// ============================================================================
+htfTimeframe          = input.timeframe("240", "HTF (Higher Timeframe)", group = "Timeframes")
+parentTimeframe       = input.timeframe("D", "Parent HTF (for nested Time confluence)", group = "Timeframes")
+useNestedConfluence   = input.bool(true, "Require deep Time premium/discount across HTF + Parent HTF", group = "Timeframes")
+
+useAnchorFilter       = input.bool(true, "Restrict HTF opens to ANCHOR_TIMES", group = "Anchor / Session")
+anchorWindow1         = input.session("1000-1005", "Anchor Window 1 (HTF open must fall inside)", group = "Anchor / Session")
+anchorWindow2         = input.session("1400-1405", "Anchor Window 2 (HTF open must fall inside)", group = "Anchor / Session")
+sessionTimezone       = input.string("America/New_York", "Exchange Timezone", group = "Anchor / Session")
+useSessionFilter      = input.bool(false, "Restrict trading to SESSION_FILTER window", group = "Anchor / Session")
+tradingSession        = input.session("0000-2359", "Allowed Trading Session", group = "Anchor / Session")
+
+minAccumulationBars   = input.int(3, "Minimum bars before a sweep can be recognized", minval = 1, group = "Accumulation / Manipulation")
+obLookback            = input.int(15, "Order Block lookback (bars)", minval = 1, maxval = 200, group = "Accumulation / Manipulation")
+
+entryModelInput       = input.string("IFG", "ENTRY_MODEL", options = ["IFG", "CISD", "BOTH_AND", "BOTH_OR"], group = "Entry Confirmation")
+requireNConfirmingCloses = input.int(1, "Require N consecutive confirming closes (IFG)", minval = 1, maxval = 5, group = "Entry Confirmation")
+requireObRetest       = input.bool(false, "Higher-conviction mode: require retrace into Order Block + re-break", group = "Entry Confirmation")
+
+minRR                 = input.float(2.0, "MIN_RR (minimum risk:reward to primary target)", minval = 0.1, step = 0.1, group = "Trade Management")
+counterTrendMinRRMultiplier = input.float(1.5, "Counter-trend MIN_RR multiplier", minval = 1.0, step = 0.1, group = "Trade Management")
+counterTrendSizeMultiplier  = input.float(0.5, "Counter-trend position size multiplier", minval = 0.1, maxval = 1.0, step = 0.1, group = "Trade Management")
+contractsPerTrade     = input.int(1, "Base contracts per trade", minval = 1, group = "Trade Management")
+partialPct            = input.float(50, "Partial close % at primary target", minval = 10, maxval = 100, group = "Trade Management")
+runnerExtension       = input.float(1.618, "Runner target extension multiple (beyond primary target)", minval = 1.0, step = 0.1, group = "Trade Management")
+moveStopToBreakeven   = input.bool(true, "Move stop to breakeven after partial fill", group = "Trade Management")
+
+showDebugTable        = input.bool(true, "Show state debug table", group = "Display")
+
+// ============================================================================
+// STATE CONSTANTS
+// ============================================================================
+STATE_ACCUM = 0
+STATE_MANIP = 1
+STATE_DONE  = 2
+
+var int   state              = STATE_ACCUM
+var float htfOpen             = na
+var float htfHigh             = na
+var float htfLow              = na
+var int   htfBarIndex         = na
+var float parentOpen          = na
+
+var float accHigh             = na
+var float accLow              = na
+
+var float sweepExtreme        = na
+var int   manipDir            = 0     // +1 = expecting long (swept accumulation low), -1 = expecting short (swept accumulation high)
+var float obHigh              = na
+var float obLow               = na
+
+var float fvgLevel            = na
+var int   fvgDir              = 0     // matches manipDir once an FVG is locked in
+var int   confirmingCloses    = 0
+
+var int   cisdRunDir          = 0
+var float cisdRunStartOpen    = na
+
+var bool  awaitingObRetest     = false
+var bool  obTouchedForRetest   = false
+
+var float primaryTarget       = na
+var float runnerTarget        = na
+var float stopPrice           = na
+var bool  stopMovedToBE       = false
+
+var string lastNoTradeReason  = ""
+
+// ============================================================================
+// HTF / PARENT HTF SYNTHETIC CANDLE TRACKING (built from confirmed LTF bars, no repaint)
+// ============================================================================
+newHtfBar    = timeframe.change(htfTimeframe)
+newParentBar = timeframe.change(parentTimeframe)
+
+if newParentBar
+    parentOpen := open
+
+if newHtfBar
+    htfOpen := open
+    htfHigh := high
+    htfLow := low
+    htfBarIndex := bar_index
+    accHigh := high
+    accLow := low
+    state := STATE_ACCUM
+    sweepExtreme := na
+    manipDir := 0
+    obHigh := na
+    obLow := na
+    fvgLevel := na
+    fvgDir := 0
+    confirmingCloses := 0
+    cisdRunDir := 0
+    cisdRunStartOpen := na
+    awaitingObRetest := false
+    obTouchedForRetest := false
+    primaryTarget := na
+    runnerTarget := na
+    stopPrice := na
+    stopMovedToBE := false
+else
+    htfHigh := math.max(htfHigh, high)
+    htfLow := math.min(htfLow, low)
+
+barsSinceHtfOpen = bar_index - htfBarIndex
+
+// Anchor filter is evaluated once, on the HTF-open bar, and latched for the whole HTF period.
+var bool anchorMatched = true
+if newHtfBar
+    inAnchor1 = not na(time(timeframe.period, anchorWindow1, sessionTimezone))
+    inAnchor2 = not na(time(timeframe.period, anchorWindow2, sessionTimezone))
+    anchorMatched := not useAnchorFilter or inAnchor1 or inAnchor2
+
+sessionOk = not useSessionFilter or not na(time(timeframe.period, tradingSession, sessionTimezone))
+
+// ============================================================================
+// TIME PREMIUM / TIME DISCOUNT (spec section 2)
+// ============================================================================
+timePremium  = close > htfOpen
+timeDiscount = close < htfOpen
+deepPremium  = useNestedConfluence ? (timePremium and close > parentOpen) : timePremium
+deepDiscount = useNestedConfluence ? (timeDiscount and close < parentOpen) : timeDiscount
+
+// ============================================================================
+// ACCUMULATION -> MANIPULATION (liquidity sweep) detection
+// ============================================================================
+if state == STATE_ACCUM
+    canCheckSweep = barsSinceHtfOpen >= minAccumulationBars
+    sweptHigh = canCheckSweep and high > accHigh and close <= accHigh
+    sweptLow  = canCheckSweep and low  < accLow  and close >= accLow
+
+    if sweptHigh and not sweptLow
+        sweepExtreme := high
+        manipDir := -1
+        state := STATE_MANIP
+        for i = 1 to obLookback
+            if close[i] < open[i]
+                obHigh := high[i]
+                obLow := low[i]
+                break
+    else if sweptLow and not sweptHigh
+        sweepExtreme := low
+        manipDir := 1
+        state := STATE_MANIP
+        for i = 1 to obLookback
+            if close[i] > open[i]
+                obHigh := high[i]
+                obLow := low[i]
+                break
+    else
+        // Still ranging (or an indecisive bar swept both sides at once) -- keep building the range.
+        accHigh := math.max(accHigh, high)
+        accLow := math.min(accLow, low)
+
+// Deeper sweep before confirmation: update the extreme and restart the confirmation search.
+if state == STATE_MANIP
+    if manipDir == -1 and high > sweepExtreme
+        sweepExtreme := high
+        fvgLevel := na
+        fvgDir := 0
+        confirmingCloses := 0
+        cisdRunDir := 0
+        cisdRunStartOpen := na
+        awaitingObRetest := false
+        obTouchedForRetest := false
+    if manipDir == 1 and low < sweepExtreme
+        sweepExtreme := low
+        fvgLevel := na
+        fvgDir := 0
+        confirmingCloses := 0
+        cisdRunDir := 0
+        cisdRunStartOpen := na
+        awaitingObRetest := false
+        obTouchedForRetest := false
+
+// ============================================================================
+// ENTRY CONFIRMATION (spec section 4): IFG (primary) and CISD (secondary)
+// ============================================================================
+// IFG: an FVG formed during the manipulation leg (opposite the anticipated reversal) that price
+// later closes beyond, inverting its polarity -- e.g. a bearish FVG closed above becomes bullish support.
+bearishFvgNow = low[2] > high     // C1.low > C3.high  (three-bar gap formed on a down leg)
+bullishFvgNow = high[2] < low     // C1.high < C3.low  (three-bar gap formed on an up leg)
+
+if state == STATE_MANIP and na(fvgLevel)
+    if manipDir == 1 and bearishFvgNow
+        fvgLevel := low[2]
+        fvgDir := 1
+    else if manipDir == -1 and bullishFvgNow
+        fvgLevel := high[2]
+        fvgDir := -1
+
+ifgCloseConfirm = false
+if state == STATE_MANIP and not na(fvgLevel)
+    closesBeyond = (fvgDir == 1 and close > fvgLevel) or (fvgDir == -1 and close < fvgLevel)
+    confirmingCloses := closesBeyond ? confirmingCloses + 1 : 0
+    ifgCloseConfirm := confirmingCloses >= requireNConfirmingCloses
+
+// CISD: a close that breaks the most recent same-direction close run (the manipulation leg) in the
+// opposite (reversal) direction, closing beyond that run's first candle's open.
+dirNow = close > open ? 1 : close < open ? -1 : 0
+cisdConfirmedBar = false
+if state == STATE_MANIP
+    if dirNow != 0 and dirNow != cisdRunDir
+        if cisdRunDir != 0
+            if manipDir == 1 and cisdRunDir == -1 and dirNow == 1 and close > cisdRunStartOpen
+                cisdConfirmedBar := true
+            if manipDir == -1 and cisdRunDir == 1 and dirNow == -1 and close < cisdRunStartOpen
+                cisdConfirmedBar := true
+        cisdRunDir := dirNow
+        cisdRunStartOpen := open
+
+ifgOk = ifgCloseConfirm
+cisdOk = cisdConfirmedBar
+confirmed = entryModelInput == "IFG" ? ifgOk :
+             entryModelInput == "CISD" ? cisdOk :
+             entryModelInput == "BOTH_AND" ? (ifgOk and cisdOk) : (ifgOk or cisdOk)
+
+// Higher-conviction filter: require a retrace back into the Order Block and a re-break in trade direction.
+if confirmed and requireObRetest and not na(obHigh)
+    awaitingObRetest := true
+    confirmed := false
+
+if awaitingObRetest and state == STATE_MANIP
+    touchedOb = low <= obHigh and high >= obLow
+    obTouchedForRetest := obTouchedForRetest or touchedOb
+    if obTouchedForRetest
+        rebreak = (manipDir == 1 and close > obHigh) or (manipDir == -1 and close < obLow)
+        if rebreak
+            confirmed := true
+            awaitingObRetest := false
+
+// ============================================================================
+// TIME + PRICE CONFLUENCE GATE (spec section 2) + MIN_RR + counter-trend flag
+// ============================================================================
+eqLevel = (accHigh + accLow) / 2.0
+
+priceOkLong  = (not na(obLow) and low <= obHigh and high >= obLow) or (close < eqLevel)
+priceOkShort = (not na(obHigh) and high >= obLow and low <= obHigh) or (close > eqLevel)
+
+timeOkLong  = deepDiscount
+timeOkShort = deepPremium
+
+parentBiasUp = close > parentOpen
+counterTrendLong  = not parentBiasUp   // long against a parent-HTF-down bias
+counterTrendShort = parentBiasUp       // short against a parent-HTF-up bias
+
+if state == STATE_MANIP and confirmed and strategy.position_size == 0
+    if manipDir == 1
+        stopLvl = sweepExtreme
+        risk    = close - stopLvl
+        targetLvl = accHigh
+        reward  = targetLvl - close
+        rr = risk > 0 ? reward / risk : na
+        effMinRR = counterTrendLong ? minRR * counterTrendMinRRMultiplier : minRR
+
+        if timeOkLong and priceOkLong and anchorMatched and sessionOk and not na(rr) and rr >= effMinRR
+            qty = counterTrendLong ? math.max(1, math.round(contractsPerTrade * counterTrendSizeMultiplier)) : contractsPerTrade
+            stopPrice := stopLvl
+            primaryTarget := targetLvl
+            runnerTarget := close + (targetLvl - close) * runnerExtension
+            strategy.entry("Long", strategy.long, qty = qty)
+            strategy.exit("TP1-Long", "Long", qty_percent = partialPct, limit = primaryTarget, stop = stopPrice)
+            strategy.exit("Runner-Long", "Long", qty_percent = 100, limit = runnerTarget, stop = stopPrice)
+            state := STATE_DONE
+        else
+            lastNoTradeReason := "long: time/price/RR/session gate failed"
+
+    if manipDir == -1
+        stopLvl = sweepExtreme
+        risk    = stopLvl - close
+        targetLvl = accLow
+        reward  = close - targetLvl
+        rr = risk > 0 ? reward / risk : na
+        effMinRR = counterTrendShort ? minRR * counterTrendMinRRMultiplier : minRR
+
+        if timeOkShort and priceOkShort and anchorMatched and sessionOk and not na(rr) and rr >= effMinRR
+            qty = counterTrendShort ? math.max(1, math.round(contractsPerTrade * counterTrendSizeMultiplier)) : contractsPerTrade
+            stopPrice := stopLvl
+            primaryTarget := targetLvl
+            runnerTarget := close - (close - targetLvl) * runnerExtension
+            strategy.entry("Short", strategy.short, qty = qty)
+            strategy.exit("TP1-Short", "Short", qty_percent = partialPct, limit = primaryTarget, stop = stopPrice)
+            strategy.exit("Runner-Short", "Short", qty_percent = 100, limit = runnerTarget, stop = stopPrice)
+            state := STATE_DONE
+        else
+            lastNoTradeReason := "short: time/price/RR/session gate failed"
+
+// Move stop to breakeven on the runner once the partial target has been touched (once per HTF cycle).
+if moveStopToBreakeven and strategy.position_size != 0 and not na(primaryTarget) and not stopMovedToBE
+    reachedLong  = strategy.position_size > 0 and high >= primaryTarget
+    reachedShort = strategy.position_size < 0 and low <= primaryTarget
+    if reachedLong or reachedShort
+        entryPx = strategy.opentrades.entry_price(strategy.opentrades - 1)
+        stopPrice := entryPx
+        stopMovedToBE := true
+        if strategy.position_size > 0
+            strategy.exit("Runner-Long", "Long", qty_percent = 100, limit = runnerTarget, stop = stopPrice)
+        if strategy.position_size < 0
+            strategy.exit("Runner-Short", "Short", qty_percent = 100, limit = runnerTarget, stop = stopPrice)
+
+// ============================================================================
+// PLOTTING / VISUALS
+// ============================================================================
+plot(state != STATE_DONE ? accHigh : na, "Accumulation High", color = color.new(color.orange, 0), style = plot.style_linebr)
+plot(state != STATE_DONE ? accLow  : na, "Accumulation Low",  color = color.new(color.orange, 0), style = plot.style_linebr)
+
+bgcolor(deepPremium ? color.new(color.red, 92) : deepDiscount ? color.new(color.green, 92) : na, title = "Time Premium/Discount")
+
+plotshape(state == STATE_MANIP and manipDir == -1 and sweepExtreme == high, title = "Sweep High",
+     style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny)
+plotshape(state == STATE_MANIP and manipDir == 1 and sweepExtreme == low, title = "Sweep Low",
+     style = shape.triangleup, location = location.belowbar, color = color.green, size = size.tiny)
+
+plotshape(strategy.position_size > 0 and strategy.position_size[1] == 0, title = "Long Entry",
+     style = shape.labelup, location = location.belowbar, color = color.green, textcolor = color.white, text = "L")
+plotshape(strategy.position_size < 0 and strategy.position_size[1] == 0, title = "Short Entry",
+     style = shape.labeldown, location = location.abovebar, color = color.red, textcolor = color.white, text = "S")
+
+alertcondition(strategy.position_size > 0 and strategy.position_size[1] == 0, title = "PO3 Long Entry", message = "PO3/AMD long entry confirmed")
+alertcondition(strategy.position_size < 0 and strategy.position_size[1] == 0, title = "PO3 Short Entry", message = "PO3/AMD short entry confirmed")
+
+if showDebugTable
+    var table dbg = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 70), border_width = 1)
+    stateLabel = state == STATE_ACCUM ? "ACCUMULATION" : state == STATE_MANIP ? "MANIPULATION" : "DONE (this HTF cycle)"
+    if barstate.islast
+        table.cell(dbg, 0, 0, "State", text_color = color.white)
+        table.cell(dbg, 1, 0, stateLabel, text_color = color.white)
+        table.cell(dbg, 0, 1, "Time", text_color = color.white)
+        table.cell(dbg, 1, 1, deepPremium ? "Deep Premium" : deepDiscount ? "Deep Discount" : "Neutral", text_color = color.white)
+        table.cell(dbg, 0, 2, "Manip Dir", text_color = color.white)
+        table.cell(dbg, 1, 2, manipDir == 1 ? "Long bias" : manipDir == -1 ? "Short bias" : "-", text_color = color.white)
+        table.cell(dbg, 0, 3, "Confirm closes", text_color = color.white)
+        table.cell(dbg, 1, 3, str.tostring(confirmingCloses), text_color = color.white)
+        table.cell(dbg, 0, 4, "Anchor / Session", text_color = color.white)
+        table.cell(dbg, 1, 4, (anchorMatched ? "OK" : "no") + " / " + (sessionOk ? "OK" : "no"), text_color = color.white)
+        table.cell(dbg, 0, 5, "Last no-trade", text_color = color.white)
+        table.cell(dbg, 1, 5, lastNoTradeReason, text_color = color.white)
