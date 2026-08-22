@@ -1,208 +1,248 @@
-// PO3 / Time + Price / AMD strategy for futures.
-// Implements: HTF candle lifecycle (Open -> Accumulation -> Manipulation -> Distribution),
-// Time+Price confluence gating, IFG/CISD entry confirmation, and stop/target trade management,
-// per the "PO3 / Time + Price / AMD Futures Trading Bot" strategy specification.
+// Timebased PO3 - 4H Alignment
 //
-// State-machine mapping (spec section 3 -> this script):
-//   WAIT_FOR_HTF_OPEN / ACCUMULATION -> STATE_ACCUM
-//   MANIPULATION / CONFIRMED_REVERSAL / NO_TRADE (retry) -> STATE_MANIP
-//   ENTRY / DISTRIBUTION_MANAGE -> STATE_DONE (until strategy.exit closes the position;
-//     the next HTF open unconditionally resets to STATE_ACCUM, matching "on exit: go to WAIT_FOR_HTF_OPEN")
+// Three timeframes:
+//   - HTF (4H, anchored to fixed NY times 02/06/10/14/18/22) : which 4H cycle we're in, and its
+//     developing open/high/low.
+//   - FVG detection TF (default 15min)                        : where the "manipulation zone" (an
+//     FVG the market is expected to sweep into, as the wick of the 4H candle) is identified.
+//   - Entry TF (the chart's own timeframe, 1min or 5min)       : where the sweep into that zone is
+//     detected, and where inversion-FVG / BOS-CHoCH confirms the entry.
 //
-// This is a strategy specification for backtesting/education, not financial advice.
-// All parameters must be calibrated per-instrument before any sim/live use.
+// Logic:
+//   1. Flag the 6 fixed 4H opens (02:00/06:00/10:00/14:00/18:00/22:00 NY).
+//   2. Only take entries in the window from minute 1 to minute 30 after that open.
+//   3. Track the most recent 15min FVG (above open = candidate top wick, below = candidate bottom).
+//   4. Wait for entry-TF price to sweep into one of those zones -> that is the 4H candle's wick.
+//      Swept into the zone above -> short bias (manipulation up). Swept into the zone below ->
+//      long bias (manipulation down).
+//   5. Confirm on the entry TF with an inversion FVG and/or a BOS/CHoCH (pivot break), per
+//      ENTRY_MODEL, before entering.
+//
+// Risk: stop beyond the manipulation wick extreme, fixed 1:2 (configurable) R:R target, single
+// exit (no partials/runner). One trade per 4H cycle. Daily trade-count and daily-P&L lockouts,
+// a named session filter (New York default, Asia/London/custom/all-day), and a "skip first N
+// minutes of the session" filter are included.
+//
+// Webhook automation (e.g. PickMyTrade): this script only manages SSL/TP internally via
+// strategy.exit and does not call alert()/alertcondition() with a broker-specific JSON payload,
+// because that payload's exact required field names are account/provider-specific. Create ONE
+// TradingView alert on this strategy with alert type "Order fills only", and use a message
+// template with TradingView's own placeholders, e.g.:
+//   {"ticker": "{{ticker}}", "action": "{{strategy.order.action}}",
+//    "quantity": "{{strategy.order.contracts}}", "price": "{{close}}", "sl": 0, "tp": 0}
+// Verify the exact field names/values PickMyTrade expects in your own PickMyTrade dashboard
+// before wiring this to a live broker connection.
+//
+// This is a strategy specification for backtesting/education, not financial advice. All inputs
+// must be calibrated on the target instrument (this version's defaults were tuned for MNQ) before
+// any sim/live use.
 //
 //@version=5
-strategy("PO3 / Time+Price / AMD Strategy", shorttitle = "PO3-AMD", overlay = true,
+strategy("Timebased PO3 - 4H Alignment", shorttitle = "PO3-4H", overlay = true,
      default_qty_type = strategy.fixed, default_qty_value = 1,
      initial_capital = 50000, currency = currency.USD,
-     max_bars_back = 5000, max_lines_count = 20, max_labels_count = 20,
+     max_bars_back = 500, max_lines_count = 20, max_labels_count = 20,
      calc_on_every_tick = false)
 
 // ============================================================================
-// CONFIGURATION PARAMETERS (spec section 1)
+// INPUTS
 // ============================================================================
-htfTimeframe          = input.timeframe("240", "HTF (Higher Timeframe)", group = "Timeframes")
-parentTimeframe       = input.timeframe("D", "Parent HTF (for nested Time confluence)", group = "Timeframes")
-useNestedConfluence   = input.bool(true, "Require deep Time premium/discount across HTF + Parent HTF", group = "Timeframes")
+fvgTF                 = input.timeframe("15", "FVG Detection Timeframe", group = "Timeframes")
+anchorHoursInput      = input.string("2,6,10,14,18,22", "4H Anchor Hours (NY time, 24h, comma-separated)", group = "Timeframes")
+sessionTimezone       = input.string("America/New_York", "Exchange Timezone", group = "Timeframes")
+entryWindowMinutes    = input.int(30, "Entry window length after each anchor (minutes)", minval = 1, group = "Timeframes")
 
-useAnchorFilter       = input.bool(true, "Restrict HTF opens to ANCHOR_TIMES", group = "Anchor / Session")
-anchorWindow1         = input.session("1000-1005", "Anchor Window 1 (HTF open must fall inside)", group = "Anchor / Session")
-anchorWindow2         = input.session("1400-1405", "Anchor Window 2 (HTF open must fall inside)", group = "Anchor / Session")
-sessionTimezone       = input.string("America/New_York", "Exchange Timezone", group = "Anchor / Session")
-useSessionFilter      = input.bool(false, "Restrict trading to SESSION_FILTER window", group = "Anchor / Session")
-tradingSession        = input.session("0000-2359", "Allowed Trading Session", group = "Anchor / Session")
-
-minAccumulationBars   = input.int(3, "Minimum bars before a sweep can be recognized", minval = 1, group = "Accumulation / Manipulation")
-obLookback            = input.int(15, "Order Block lookback (bars)", minval = 1, maxval = 200, group = "Accumulation / Manipulation")
-
-entryModelInput       = input.string("IFG", "ENTRY_MODEL", options = ["IFG", "CISD", "BOTH_AND", "BOTH_OR"], group = "Entry Confirmation")
+manipConfirmModel     = input.string("BOTH_OR", "ENTRY_MODEL (confirmation)", options = ["IFG", "CHOCH", "BOTH_AND", "BOTH_OR"], group = "Entry Confirmation")
 requireNConfirmingCloses = input.int(1, "Require N consecutive confirming closes (IFG)", minval = 1, maxval = 5, group = "Entry Confirmation")
-requireObRetest       = input.bool(false, "Higher-conviction mode: require retrace into Order Block + re-break", group = "Entry Confirmation")
 
-minRR                 = input.float(2.0, "MIN_RR (minimum risk:reward to primary target)", minval = 0.1, step = 0.1, group = "Trade Management")
-counterTrendMinRRMultiplier = input.float(1.5, "Counter-trend MIN_RR multiplier", minval = 1.0, step = 0.1, group = "Trade Management")
-counterTrendSizeMultiplier  = input.float(0.5, "Counter-trend position size multiplier", minval = 0.1, maxval = 1.0, step = 0.1, group = "Trade Management")
-contractsPerTrade     = input.int(1, "Base contracts per trade", minval = 1, group = "Trade Management")
-partialPct            = input.float(50, "Partial close % at primary target", minval = 10, maxval = 100, group = "Trade Management")
-runnerExtension       = input.float(1.618, "Runner target extension multiple (beyond primary target)", minval = 1.0, step = 0.1, group = "Trade Management")
-moveStopToBreakeven   = input.bool(true, "Move stop to breakeven after partial fill", group = "Trade Management")
+fixedRR               = input.float(2.0, "Fixed Risk:Reward (TP = entry +/- RR x risk)", minval = 0.1, step = 0.1, group = "Trade Management")
+contractsPerTrade     = input.int(1, "Contracts per trade", minval = 1, group = "Trade Management")
+
+sessionChoice         = input.string("New York", "Trading Session", options = ["New York", "Asia", "London", "All Day", "Custom"], group = "Filters")
+customSessionInput    = input.session("0000-2359", "Custom session (used when Trading Session = Custom)", group = "Filters")
+skipMinutesAfterOpen  = input.int(0, "Skip first N minutes after session open", minval = 0, group = "Filters")
+maxTradesPerDay       = input.int(3, "Max trades per day", minval = 1, group = "Filters")
+maxDailyLossUSD       = input.float(500, "Max daily loss lockout ($, 0 = disabled)", minval = 0, group = "Filters")
+maxDailyProfitUSD     = input.float(0, "Max daily profit lockout ($, 0 = disabled)", minval = 0, group = "Filters")
 
 showDebugTable        = input.bool(true, "Show state debug table", group = "Display")
 
 // ============================================================================
+// SESSION PRESET
+// ============================================================================
+// "Asia"/"London" windows are expressed in NY time as commonly-cited approximations (DST shifts
+// them slightly through the year) -- use "Custom" with your own input.session string for precision.
+sessionString = sessionChoice == "New York" ? "0930-1600" :
+     sessionChoice == "Asia"   ? "2000-0300" :
+     sessionChoice == "London" ? "0300-1130" :
+     sessionChoice == "Custom" ? customSessionInput : "0000-2359"
+
+sessionActiveNow  = not na(time(timeframe.period, sessionString, sessionTimezone))
+sessionJustOpened = sessionActiveNow and not sessionActiveNow[1]
+var int sessionOpenTime = na
+if sessionJustOpened
+    sessionOpenTime := time
+msSinceSessionOpen = na(sessionOpenTime) ? na : time - sessionOpenTime
+skipWindowActive   = not na(msSinceSessionOpen) and msSinceSessionOpen < skipMinutesAfterOpen * 60 * 1000
+sessionOk = sessionActiveNow and not skipWindowActive
+
+// ============================================================================
+// DAILY TRADE COUNT / P&L LOCKOUT
+// ============================================================================
+dayKey = year(time, sessionTimezone) * 10000 + month(time, sessionTimezone) * 100 + dayofmonth(time, sessionTimezone)
+var int   lastDayKey     = na
+var int   dayTradeCount  = 0
+var float dayStartEquity = na
+
+newDay = na(lastDayKey) or dayKey != lastDayKey
+if newDay
+    lastDayKey := dayKey
+    dayTradeCount := 0
+    dayStartEquity := strategy.equity
+
+dayPnl = strategy.equity - dayStartEquity
+dailyLossLockout   = maxDailyLossUSD > 0 and dayPnl <= -maxDailyLossUSD
+dailyProfitLockout = maxDailyProfitUSD > 0 and dayPnl >= maxDailyProfitUSD
+tradeCountLockout  = dayTradeCount >= maxTradesPerDay
+dailyOk = not dailyLossLockout and not dailyProfitLockout and not tradeCountLockout
+
+// ============================================================================
 // STATE CONSTANTS
 // ============================================================================
-STATE_ACCUM = 0
-STATE_MANIP = 1
-STATE_DONE  = 2
+STATE_WATCH = 0   // within/near the entry window, watching for a 15m FVG zone and a sweep into it
+STATE_MANIP = 1   // swept into a zone (the 4H wick) -- watching for IFG/CHoCH confirmation
+STATE_DONE  = 2   // already entered this 4H cycle, or the entry window expired
 
-var int   state              = STATE_ACCUM
-var float htfOpen             = na
-var float htfHigh             = na
-var float htfLow              = na
-var int   htfBarIndex         = na
-var float parentOpen          = na
+var int   state          = STATE_DONE
+var float htfOpen        = na
+var float htfHigh        = na
+var float htfLow         = na
+var int   anchorTime     = na
 
-var float accHigh             = na
-var float accLow              = na
+var float upperZoneHigh  = na
+var float upperZoneLow   = na
+var float lowerZoneHigh  = na
+var float lowerZoneLow   = na
 
-var float sweepExtreme        = na
-var int   manipDir            = 0     // +1 = expecting long (swept accumulation low), -1 = expecting short (swept accumulation high)
-var float obHigh              = na
-var float obLow               = na
+var float sweepExtreme   = na
+var int   manipDir       = 0     // +1 = long bias (swept down into the lower zone), -1 = short bias (swept up into the upper zone)
 
-var float fvgLevel            = na
-var int   fvgDir              = 0     // matches manipDir once an FVG is locked in
-var int   confirmingCloses    = 0
+var float fvgLevel        = na
+var int   fvgDir          = 0
+var int   confirmingCloses = 0
 
-var int   cisdRunDir          = 0
-var float cisdRunStartOpen    = na
+var float lastPivotHigh  = na
+var float lastPivotLow   = na
 
-var bool  awaitingObRetest     = false
-var bool  obTouchedForRetest   = false
+var float primaryTarget  = na
+var float stopPrice      = na
 
-var float primaryTarget       = na
-var float runnerTarget        = na
-var float stopPrice           = na
-var bool  stopMovedToBE       = false
-
-var string lastNoTradeReason  = ""
+var string lastNoTradeReason = ""
 
 // ============================================================================
-// HTF / PARENT HTF SYNTHETIC CANDLE TRACKING (built from confirmed LTF bars, no repaint)
+// 4H ANCHOR DETECTION (fixed NY times, independent of broker HTF bar alignment)
 // ============================================================================
-newHtfBar    = timeframe.change(htfTimeframe)
-newParentBar = timeframe.change(parentTimeframe)
+var array<int> anchorHours = na
+if barstate.isfirst
+    anchorHours := array.new<int>()
+    anchorParts = str.split(anchorHoursInput, ",")
+    for p in anchorParts
+        array.push(anchorHours, int(str.tonumber(str.trim(p))))
 
-if newParentBar
-    parentOpen := open
+nyHour   = hour(time, sessionTimezone)
+nyMinute = minute(time, sessionTimezone)
+isAnchorBar = nyMinute == 0 and array.includes(anchorHours, nyHour)
 
-if newHtfBar
+if isAnchorBar
+    anchorTime := time
     htfOpen := open
     htfHigh := high
     htfLow := low
-    htfBarIndex := bar_index
-    accHigh := high
-    accLow := low
-    state := STATE_ACCUM
+    state := STATE_WATCH
+    upperZoneHigh := na
+    upperZoneLow := na
+    lowerZoneHigh := na
+    lowerZoneLow := na
     sweepExtreme := na
     manipDir := 0
-    obHigh := na
-    obLow := na
     fvgLevel := na
     fvgDir := 0
     confirmingCloses := 0
-    cisdRunDir := 0
-    cisdRunStartOpen := na
-    awaitingObRetest := false
-    obTouchedForRetest := false
+    lastPivotHigh := na
+    lastPivotLow := na
     primaryTarget := na
-    runnerTarget := na
     stopPrice := na
-    stopMovedToBE := false
 else
     htfHigh := math.max(htfHigh, high)
     htfLow := math.min(htfLow, low)
 
-barsSinceHtfOpen = bar_index - htfBarIndex
+msSinceAnchor    = na(anchorTime) ? na : time - anchorTime
+windowExpired    = na(msSinceAnchor) or msSinceAnchor > entryWindowMinutes * 60 * 1000
+withinEntryWindow = not na(msSinceAnchor) and msSinceAnchor >= 60 * 1000 and not windowExpired
 
-// Anchor filter is evaluated once, on the HTF-open bar, and latched for the whole HTF period.
-var bool anchorMatched = true
-if newHtfBar
-    inAnchor1 = not na(time(timeframe.period, anchorWindow1, sessionTimezone))
-    inAnchor2 = not na(time(timeframe.period, anchorWindow2, sessionTimezone))
-    anchorMatched := not useAnchorFilter or inAnchor1 or inAnchor2
-
-sessionOk = not useSessionFilter or not na(time(timeframe.period, tradingSession, sessionTimezone))
+if windowExpired and state != STATE_DONE
+    state := STATE_DONE
+    lastNoTradeReason := "entry window expired"
 
 // ============================================================================
-// TIME PREMIUM / TIME DISCOUNT (spec section 2)
+// 15-MIN FVG ZONE DETECTION (non-repainting: always reads closed FVG-TF bars via [1..3] offsets)
 // ============================================================================
-timePremium  = close > htfOpen
-timeDiscount = close < htfOpen
-deepPremium  = useNestedConfluence ? (timePremium and close > parentOpen) : timePremium
-deepDiscount = useNestedConfluence ? (timeDiscount and close < parentOpen) : timeDiscount
+h15_c = request.security(syminfo.tickerid, fvgTF, high[1], barmerge.gaps_off, barmerge.lookahead_off)
+l15_c = request.security(syminfo.tickerid, fvgTF, low[1],  barmerge.gaps_off, barmerge.lookahead_off)
+h15_a = request.security(syminfo.tickerid, fvgTF, high[3], barmerge.gaps_off, barmerge.lookahead_off)
+l15_a = request.security(syminfo.tickerid, fvgTF, low[3],  barmerge.gaps_off, barmerge.lookahead_off)
+t15_c = request.security(syminfo.tickerid, fvgTF, time[1], barmerge.gaps_off, barmerge.lookahead_off)
+
+new15Bar = ta.change(t15_c) != 0
+
+bullishFvg15 = l15_c > h15_a   // gap zone [h15_a, l15_c], formed on an up leg
+bearishFvg15 = h15_c < l15_a   // gap zone [h15_c, l15_a], formed on a down leg
+
+// A bullish gap (C.low > A.high) is, by construction, at or below the current close (price already
+// jumped above it) -- it is always a "lower zone" candidate. A bearish gap (C.high < A.low) is
+// always at or above the current close -- always an "upper zone" candidate. No need to compare
+// against htfOpen: the gap's own definition fixes which side of price it sits on.
+if state == STATE_WATCH and new15Bar and not windowExpired
+    if bullishFvg15
+        lowerZoneHigh := l15_c
+        lowerZoneLow  := h15_a
+    if bearishFvg15
+        upperZoneHigh := l15_a
+        upperZoneLow  := h15_c
 
 // ============================================================================
-// ACCUMULATION -> MANIPULATION (liquidity sweep) detection
+// MANIPULATION: entry-TF price sweeps into a zone -> that is the 4H candle's wick
 // ============================================================================
-if state == STATE_ACCUM
-    canCheckSweep = barsSinceHtfOpen >= minAccumulationBars
-    sweptHigh = canCheckSweep and high > accHigh and close <= accHigh
-    sweptLow  = canCheckSweep and low  < accLow  and close >= accLow
-
-    if sweptHigh and not sweptLow
-        sweepExtreme := high
+if state == STATE_WATCH and not windowExpired
+    sweptUp   = not na(upperZoneLow) and high >= upperZoneLow
+    sweptDown = not na(lowerZoneHigh) and low <= lowerZoneHigh
+    if sweptUp and not sweptDown
         manipDir := -1
+        sweepExtreme := high
         state := STATE_MANIP
-        for i = 1 to obLookback
-            if close[i] < open[i]
-                obHigh := high[i]
-                obLow := low[i]
-                break
-    else if sweptLow and not sweptHigh
-        sweepExtreme := low
+    else if sweptDown and not sweptUp
         manipDir := 1
+        sweepExtreme := low
         state := STATE_MANIP
-        for i = 1 to obLookback
-            if close[i] > open[i]
-                obHigh := high[i]
-                obLow := low[i]
-                break
-    else
-        // Still ranging (or an indecisive bar swept both sides at once) -- keep building the range.
-        accHigh := math.max(accHigh, high)
-        accLow := math.min(accLow, low)
 
-// Deeper sweep before confirmation: update the extreme and restart the confirmation search.
+// Deeper wick before confirmation: extend the extreme and restart the confirmation search.
 if state == STATE_MANIP
     if manipDir == -1 and high > sweepExtreme
         sweepExtreme := high
         fvgLevel := na
         fvgDir := 0
         confirmingCloses := 0
-        cisdRunDir := 0
-        cisdRunStartOpen := na
-        awaitingObRetest := false
-        obTouchedForRetest := false
     if manipDir == 1 and low < sweepExtreme
         sweepExtreme := low
         fvgLevel := na
         fvgDir := 0
         confirmingCloses := 0
-        cisdRunDir := 0
-        cisdRunStartOpen := na
-        awaitingObRetest := false
-        obTouchedForRetest := false
 
 // ============================================================================
-// ENTRY CONFIRMATION (spec section 4): IFG (primary) and CISD (secondary)
+// ENTRY CONFIRMATION: inversion FVG (entry TF) and/or BOS/CHoCH (pivot break)
 // ============================================================================
-// IFG: an FVG formed during the manipulation leg (opposite the anticipated reversal) that price
-// later closes beyond, inverting its polarity -- e.g. a bearish FVG closed above becomes bullish support.
-bearishFvgNow = low[2] > high     // C1.low > C3.high  (three-bar gap formed on a down leg)
-bullishFvgNow = high[2] < low     // C1.high < C3.low  (three-bar gap formed on an up leg)
+bearishFvgNow = low[2] > high     // C1.low > C3.high (entry-TF 3-bar gap on a down leg)
+bullishFvgNow = high[2] < low     // C1.high < C3.low (entry-TF 3-bar gap on an up leg)
 
 if state == STATE_MANIP and na(fvgLevel)
     if manipDir == 1 and bearishFvgNow
@@ -218,120 +258,65 @@ if state == STATE_MANIP and not na(fvgLevel)
     confirmingCloses := closesBeyond ? confirmingCloses + 1 : 0
     ifgCloseConfirm := confirmingCloses >= requireNConfirmingCloses
 
-// CISD: a close that breaks the most recent same-direction close run (the manipulation leg) in the
-// opposite (reversal) direction, closing beyond that run's first candle's open.
-dirNow = close > open ? 1 : close < open ? -1 : 0
-cisdConfirmedBar = false
+ph = ta.pivothigh(1, 1)
+pl = ta.pivotlow(1, 1)
 if state == STATE_MANIP
-    if dirNow != 0 and dirNow != cisdRunDir
-        if cisdRunDir != 0
-            if manipDir == 1 and cisdRunDir == -1 and dirNow == 1 and close > cisdRunStartOpen
-                cisdConfirmedBar := true
-            if manipDir == -1 and cisdRunDir == 1 and dirNow == -1 and close < cisdRunStartOpen
-                cisdConfirmedBar := true
-        cisdRunDir := dirNow
-        cisdRunStartOpen := open
+    if not na(ph)
+        lastPivotHigh := ph
+    if not na(pl)
+        lastPivotLow := pl
+
+chochOk = state == STATE_MANIP and (
+     (manipDir == 1 and not na(lastPivotHigh) and close > lastPivotHigh) or
+     (manipDir == -1 and not na(lastPivotLow) and close < lastPivotLow))
 
 ifgOk = ifgCloseConfirm
-cisdOk = cisdConfirmedBar
-confirmed = entryModelInput == "IFG" ? ifgOk :
-             entryModelInput == "CISD" ? cisdOk :
-             entryModelInput == "BOTH_AND" ? (ifgOk and cisdOk) : (ifgOk or cisdOk)
-
-// Higher-conviction filter: require a retrace back into the Order Block and a re-break in trade direction.
-if confirmed and requireObRetest and not na(obHigh)
-    awaitingObRetest := true
-    confirmed := false
-
-if awaitingObRetest and state == STATE_MANIP
-    touchedOb = low <= obHigh and high >= obLow
-    obTouchedForRetest := obTouchedForRetest or touchedOb
-    if obTouchedForRetest
-        rebreak = (manipDir == 1 and close > obHigh) or (manipDir == -1 and close < obLow)
-        if rebreak
-            confirmed := true
-            awaitingObRetest := false
+confirmed = manipConfirmModel == "IFG" ? ifgOk :
+     manipConfirmModel == "CHOCH" ? chochOk :
+     manipConfirmModel == "BOTH_AND" ? (ifgOk and chochOk) : (ifgOk or chochOk)
 
 // ============================================================================
-// TIME + PRICE CONFLUENCE GATE (spec section 2) + MIN_RR + counter-trend flag
+// TRADE EXECUTION
 // ============================================================================
-eqLevel = (accHigh + accLow) / 2.0
-
-priceOkLong  = (not na(obLow) and low <= obHigh and high >= obLow) or (close < eqLevel)
-priceOkShort = (not na(obHigh) and high >= obLow and low <= obHigh) or (close > eqLevel)
-
-timeOkLong  = deepDiscount
-timeOkShort = deepPremium
-
-parentBiasUp = close > parentOpen
-counterTrendLong  = not parentBiasUp   // long against a parent-HTF-down bias
-counterTrendShort = parentBiasUp       // short against a parent-HTF-up bias
-
-if state == STATE_MANIP and confirmed and strategy.position_size == 0
-    if manipDir == 1
+if state == STATE_MANIP and confirmed and withinEntryWindow and strategy.position_size == 0
+    if not (sessionOk and dailyOk)
+        lastNoTradeReason := "session/daily filter blocked entry"
+    else if manipDir == 1
         stopLvl = sweepExtreme
         risk    = close - stopLvl
-        targetLvl = accHigh
-        reward  = targetLvl - close
-        rr = risk > 0 ? reward / risk : na
-        effMinRR = counterTrendLong ? minRR * counterTrendMinRRMultiplier : minRR
-
-        if timeOkLong and priceOkLong and anchorMatched and sessionOk and not na(rr) and rr >= effMinRR
-            qty = counterTrendLong ? math.max(1, math.round(contractsPerTrade * counterTrendSizeMultiplier)) : contractsPerTrade
+        if risk > 0
             stopPrice := stopLvl
-            primaryTarget := targetLvl
-            runnerTarget := close + (targetLvl - close) * runnerExtension
-            strategy.entry("Long", strategy.long, qty = qty)
-            strategy.exit("TP1-Long", "Long", qty_percent = partialPct, limit = primaryTarget, stop = stopPrice)
-            strategy.exit("Runner-Long", "Long", qty_percent = 100, limit = runnerTarget, stop = stopPrice)
+            primaryTarget := close + risk * fixedRR
+            strategy.entry("Long", strategy.long, qty = contractsPerTrade)
+            strategy.exit("Exit-Long", "Long", limit = primaryTarget, stop = stopPrice)
+            dayTradeCount := dayTradeCount + 1
             state := STATE_DONE
-        else
-            lastNoTradeReason := "long: time/price/RR/session gate failed"
-
-    if manipDir == -1
+    else if manipDir == -1
         stopLvl = sweepExtreme
         risk    = stopLvl - close
-        targetLvl = accLow
-        reward  = close - targetLvl
-        rr = risk > 0 ? reward / risk : na
-        effMinRR = counterTrendShort ? minRR * counterTrendMinRRMultiplier : minRR
-
-        if timeOkShort and priceOkShort and anchorMatched and sessionOk and not na(rr) and rr >= effMinRR
-            qty = counterTrendShort ? math.max(1, math.round(contractsPerTrade * counterTrendSizeMultiplier)) : contractsPerTrade
+        if risk > 0
             stopPrice := stopLvl
-            primaryTarget := targetLvl
-            runnerTarget := close - (close - targetLvl) * runnerExtension
-            strategy.entry("Short", strategy.short, qty = qty)
-            strategy.exit("TP1-Short", "Short", qty_percent = partialPct, limit = primaryTarget, stop = stopPrice)
-            strategy.exit("Runner-Short", "Short", qty_percent = 100, limit = runnerTarget, stop = stopPrice)
+            primaryTarget := close - risk * fixedRR
+            strategy.entry("Short", strategy.short, qty = contractsPerTrade)
+            strategy.exit("Exit-Short", "Short", limit = primaryTarget, stop = stopPrice)
+            dayTradeCount := dayTradeCount + 1
             state := STATE_DONE
-        else
-            lastNoTradeReason := "short: time/price/RR/session gate failed"
-
-// Move stop to breakeven on the runner once the partial target has been touched (once per HTF cycle).
-if moveStopToBreakeven and strategy.position_size != 0 and not na(primaryTarget) and not stopMovedToBE
-    reachedLong  = strategy.position_size > 0 and high >= primaryTarget
-    reachedShort = strategy.position_size < 0 and low <= primaryTarget
-    if reachedLong or reachedShort
-        entryPx = strategy.opentrades.entry_price(strategy.opentrades - 1)
-        stopPrice := entryPx
-        stopMovedToBE := true
-        if strategy.position_size > 0
-            strategy.exit("Runner-Long", "Long", qty_percent = 100, limit = runnerTarget, stop = stopPrice)
-        if strategy.position_size < 0
-            strategy.exit("Runner-Short", "Short", qty_percent = 100, limit = runnerTarget, stop = stopPrice)
 
 // ============================================================================
 // PLOTTING / VISUALS
 // ============================================================================
-plot(state != STATE_DONE ? accHigh : na, "Accumulation High", color = color.new(color.orange, 0), style = plot.style_linebr)
-plot(state != STATE_DONE ? accLow  : na, "Accumulation Low",  color = color.new(color.orange, 0), style = plot.style_linebr)
+plot(state != STATE_DONE ? htfOpen : na, "4H Open", color = color.new(color.gray, 20), style = plot.style_circles)
 
-bgcolor(deepPremium ? color.new(color.red, 92) : deepDiscount ? color.new(color.green, 92) : na, title = "Time Premium/Discount")
+plot(state != STATE_DONE ? upperZoneHigh : na, "Upper FVG Zone High", color = color.new(color.red, 40), style = plot.style_linebr)
+plot(state != STATE_DONE ? upperZoneLow  : na, "Upper FVG Zone Low",  color = color.new(color.red, 40), style = plot.style_linebr)
+plot(state != STATE_DONE ? lowerZoneHigh : na, "Lower FVG Zone High", color = color.new(color.green, 40), style = plot.style_linebr)
+plot(state != STATE_DONE ? lowerZoneLow  : na, "Lower FVG Zone Low",  color = color.new(color.green, 40), style = plot.style_linebr)
 
-plotshape(state == STATE_MANIP and manipDir == -1 and sweepExtreme == high, title = "Sweep High",
+bgcolor(withinEntryWindow ? color.new(color.blue, 90) : na, title = "Active entry window")
+
+plotshape(state == STATE_MANIP and manipDir == -1 and sweepExtreme == high, title = "Sweep Up (top wick)",
      style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny)
-plotshape(state == STATE_MANIP and manipDir == 1 and sweepExtreme == low, title = "Sweep Low",
+plotshape(state == STATE_MANIP and manipDir == 1 and sweepExtreme == low, title = "Sweep Down (bottom wick)",
      style = shape.triangleup, location = location.belowbar, color = color.green, size = size.tiny)
 
 plotshape(strategy.position_size > 0 and strategy.position_size[1] == 0, title = "Long Entry",
@@ -339,22 +324,26 @@ plotshape(strategy.position_size > 0 and strategy.position_size[1] == 0, title =
 plotshape(strategy.position_size < 0 and strategy.position_size[1] == 0, title = "Short Entry",
      style = shape.labeldown, location = location.abovebar, color = color.red, textcolor = color.white, text = "S")
 
-alertcondition(strategy.position_size > 0 and strategy.position_size[1] == 0, title = "PO3 Long Entry", message = "PO3/AMD long entry confirmed")
-alertcondition(strategy.position_size < 0 and strategy.position_size[1] == 0, title = "PO3 Short Entry", message = "PO3/AMD short entry confirmed")
+alertcondition(strategy.position_size > 0 and strategy.position_size[1] == 0, title = "PO3 Long Entry", message = "PO3 4H long entry confirmed")
+alertcondition(strategy.position_size < 0 and strategy.position_size[1] == 0, title = "PO3 Short Entry", message = "PO3 4H short entry confirmed")
 
 if showDebugTable
-    var table dbg = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 70), border_width = 1)
-    stateLabel = state == STATE_ACCUM ? "ACCUMULATION" : state == STATE_MANIP ? "MANIPULATION" : "DONE (this HTF cycle)"
+    var table dbg = table.new(position.top_right, 2, 8, bgcolor = color.new(color.black, 70), border_width = 1)
+    stateLabel = state == STATE_WATCH ? "WATCHING" : state == STATE_MANIP ? "MANIPULATION" : "DONE (this 4H cycle)"
     if barstate.islast
         table.cell(dbg, 0, 0, "State", text_color = color.white)
         table.cell(dbg, 1, 0, stateLabel, text_color = color.white)
-        table.cell(dbg, 0, 1, "Time", text_color = color.white)
-        table.cell(dbg, 1, 1, deepPremium ? "Deep Premium" : deepDiscount ? "Deep Discount" : "Neutral", text_color = color.white)
+        table.cell(dbg, 0, 1, "Entry window", text_color = color.white)
+        table.cell(dbg, 1, 1, withinEntryWindow ? "OPEN" : windowExpired ? "expired" : "not yet (< 1min)", text_color = color.white)
         table.cell(dbg, 0, 2, "Manip Dir", text_color = color.white)
         table.cell(dbg, 1, 2, manipDir == 1 ? "Long bias" : manipDir == -1 ? "Short bias" : "-", text_color = color.white)
         table.cell(dbg, 0, 3, "Confirm closes", text_color = color.white)
         table.cell(dbg, 1, 3, str.tostring(confirmingCloses), text_color = color.white)
-        table.cell(dbg, 0, 4, "Anchor / Session", text_color = color.white)
-        table.cell(dbg, 1, 4, (anchorMatched ? "OK" : "no") + " / " + (sessionOk ? "OK" : "no"), text_color = color.white)
-        table.cell(dbg, 0, 5, "Last no-trade", text_color = color.white)
-        table.cell(dbg, 1, 5, lastNoTradeReason, text_color = color.white)
+        table.cell(dbg, 0, 4, "Session / Skip", text_color = color.white)
+        table.cell(dbg, 1, 4, (sessionOk ? "OK" : "no"), text_color = color.white)
+        table.cell(dbg, 0, 5, "Trades today", text_color = color.white)
+        table.cell(dbg, 1, 5, str.tostring(dayTradeCount) + " / " + str.tostring(maxTradesPerDay), text_color = color.white)
+        table.cell(dbg, 0, 6, "Day P&L", text_color = color.white)
+        table.cell(dbg, 1, 6, str.tostring(dayPnl, "#.##"), text_color = color.white)
+        table.cell(dbg, 0, 7, "Last no-trade", text_color = color.white)
+        table.cell(dbg, 1, 7, lastNoTradeReason, text_color = color.white)

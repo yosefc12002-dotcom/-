@@ -1,72 +1,80 @@
-# PO3 / Time + Price / AMD Futures Strategy — TradingView (Pine Script v5)
+# Timebased PO3 - 4H Alignment — TradingView (Pine Script v5)
 
-A rule-based (non-discretionary, non-LLM) TradingView strategy implementing the
-ICT-style **Power of Three (PO3)** framework: HTF candle lifecycle
-(Accumulation → Manipulation → Distribution), **Time + Price confluence**, and
-**IFG/CISD** entry confirmation, per the project's strategy specification.
+A rule-based (non-discretionary, non-LLM) TradingView strategy implementing a
+concrete PO3/AMD futures setup: fixed 4H opens (NY time), a 15-minute FVG used
+as the expected "manipulation zone" for that 4H candle's wick, and an
+entry-timeframe (1-5min) inversion-FVG / BOS-CHoCH confirmation.
 
-This is a research/backtesting tool, not financial advice. All inputs must be
-calibrated per-instrument on the target futures contract before any sim/live use.
+This is a research/backtesting tool, not financial advice. Defaults in this
+version were tuned for **MNQ** (Micro E-mini Nasdaq-100). Back-test and
+calibrate every input on your target contract before any sim/live use.
 
 ## File
 
 - [`pinescript/po3_amd_time_price_strategy.pine`](pinescript/po3_amd_time_price_strategy.pine)
   — a single self-contained Pine Script v5 `strategy()`. Paste it into
-  TradingView's Pine Editor, add it to a chart, and run it in the Strategy
-  Tester. Run it on your entry/LTF chart timeframe (e.g. 1min–5min); the HTF
-  candle lifecycle is tracked internally from that chart's own bars via
-  `timeframe.change()` — no `request.security()` HTF repaint risk.
+  TradingView's Pine Editor, add it to a 1min or 5min chart, and run it in the
+  Strategy Tester.
 
-## Config → input mapping
+## Logic
 
-| Spec parameter | Pine input |
-|---|---|
-| `HTF` | **HTF (Higher Timeframe)** (default `240` = 4H) |
-| `LTF` | the chart timeframe the script is running on |
-| `ANCHOR_TIMES` | **Anchor Window 1 / 2** (session strings, exchange tz) + **Restrict HTF opens to ANCHOR_TIMES** toggle |
-| `ENTRY_MODEL` | **ENTRY_MODEL** dropdown: `IFG`, `CISD`, `BOTH_AND`, `BOTH_OR` |
-| `RISK_PER_TRADE` | **Base contracts per trade** (futures are traded in whole contracts, not % risk) |
-| `MIN_RR` | **MIN_RR** (+ counter-trend multiplier) |
-| `SESSION_FILTER` | **Allowed Trading Session** + **Restrict trading to SESSION_FILTER window** toggle |
+1. **4H anchor**: flags the fixed 4H opens at 02:00 / 06:00 / 10:00 / 14:00 /
+   18:00 / 22:00 New York time (configurable), independent of however the
+   broker/exchange natively aligns 4H bars.
+2. **Entry window**: only from minute 1 to minute 30 after each anchor
+   (configurable length).
+3. **15min FVG zone**: the most recent 3-candle FVG on the FVG-detection
+   timeframe (default 15min) is tracked as a target zone — a bullish gap
+   always sits below current price (a "lower zone"), a bearish gap always
+   sits above it (an "upper zone"), by construction.
+4. **Manipulation**: once entry-TF price trades into the upper zone, that's
+   the developing 4H candle's top wick (short bias); into the lower zone,
+   the bottom wick (long bias).
+5. **Confirmation**: on the entry TF, an inversion FVG (a 3-candle gap formed
+   during the wick that price later closes back through) and/or a BOS/CHoCH
+   (a close beyond the most recent pivot formed during the wick), per
+   `ENTRY_MODEL` (`IFG`, `CHOCH`, `BOTH_AND`, or `BOTH_OR` — default `BOTH_OR`,
+   i.e. either one confirms).
 
-## What it implements
+## Risk management
 
-- Synthetic HTF (and parent-HTF, e.g. Daily) candle tracking built from
-  confirmed chart bars, reset on every new HTF open.
-- Time Premium/Discount, with an optional "deep" mode requiring alignment
-  across the HTF **and** its parent HTF (nested confluence).
-- The Accumulation → Manipulation state machine: a range builds from the HTF
-  open; a liquidity sweep of that range that closes back inside flags
-  Manipulation and locks in the sweep extreme (stop level) and an Order Block
-  zone (last opposite-direction candle before the sweep).
-- IFG confirmation: an FVG that forms during the manipulation leg and is later
-  closed-through (inverted) in the reversal direction, with a configurable
-  "require N consecutive confirming closes" filter.
-- CISD confirmation: a close that breaks the manipulation leg's run of
-  same-direction closes, beyond that run's first candle's open.
-- An optional higher-conviction mode that waits for price to retrace into the
-  Order Block and re-break before entering.
-- The Time + Price confluence gate (deep premium/discount **and** price at the
-  Order Block or in the discount/premium half of the accumulation range),
-  `MIN_RR` filtering, and a counter-trend flag that raises the RR bar and cuts
-  position size when the setup runs against the parent-HTF bias.
-- Trade management: stop at the sweep extreme, partial exit at the primary
-  target (opposite accumulation boundary), a runner extended beyond it, and an
-  optional breakeven-stop move after the partial fills.
-- A debug table (state, time bias, confirmation progress, filters) and
-  `alertcondition()`s for long/short confirmed entries.
+- Stop beyond the manipulation wick extreme (extended if price wicks deeper
+  before confirmation).
+- Fixed R:R target (`fixedRR`, default 2.0 = 1:2), single exit — no
+  partials/runner.
+- One trade per 4H cycle; no new entry once a position is open.
+- Daily trade-count limit, daily loss lockout, optional daily profit lockout
+  (all in the strategy's account currency).
+- Named session filter (New York / Asia / London / All Day / Custom) plus a
+  "skip first N minutes after session open" filter.
 
-## Known simplifications vs. the full spec
+## Webhook automation (e.g. PickMyTrade)
 
-- "Price" confluence checks the Order Block and the accumulation range's 50%
-  level rather than scanning arbitrary higher-timeframe FVGs/liquidity pools —
-  a deliberate approximation to keep the script's PD-array detection bounded
-  and auditable.
-- The runner/secondary target is a fixed RR extension beyond the primary
-  target rather than a detected higher-timeframe liquidity pool.
-- One AMD cycle (and at most one trade) is tracked per HTF candle, matching the
-  spec's state diagram; it does not run parallel state machines across nested
-  timeframes (spec section 6).
+The script manages SL/TP internally via `strategy.exit` and does not embed a
+broker-specific JSON payload in an `alert()`/`alertcondition()` call, because
+that payload's exact required field names are account/provider-specific and
+could not be verified against PickMyTrade's docs from this environment
+(network access to their docs site was blocked here). Recommended setup:
 
-Back-test every input against the target contract per the spec's Section 7
-checklist before paper/live use.
+1. Create **one** TradingView alert on this strategy with alert type **"Order
+   fills only"**.
+2. Use a message template with TradingView's own placeholders, e.g.:
+   ```json
+   {"ticker": "{{ticker}}", "action": "{{strategy.order.action}}",
+    "quantity": "{{strategy.order.contracts}}", "price": "{{close}}",
+    "sl": 0, "tp": 0}
+   ```
+3. **Verify the exact field names/values your PickMyTrade account expects**
+   in the PickMyTrade dashboard's own alert-template generator before wiring
+   this to a live broker connection — do not assume the template above is
+   final.
+
+## Known simplifications
+
+- The 15min FVG zone is always the single most recently detected one on each
+  side (no history of multiple candidate zones).
+- BOS/CHoCH uses a reactive 1-bar-left/1-bar-right pivot, not a full swing-
+  structure model.
+- No Order Block retracement or Time-Premium/Discount gate from earlier
+  drafts of this strategy — this version follows the concrete 4H-anchor +
+  15m-FVG-zone spec directly instead.
