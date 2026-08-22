@@ -48,7 +48,7 @@ strategy("Timebased PO3 - 4H Alignment", shorttitle = "PO3-4H", overlay = true,
 // INPUTS
 // ============================================================================
 fvgTF                 = input.timeframe("15", "FVG Detection Timeframe", group = "Timeframes")
-anchorHoursInput      = input.string("2,6,10,14,18,22", "4H Anchor Hours (NY time, 24h, comma-separated)", group = "Timeframes")
+anchorHoursInput      = input.string("2,10,14", "4H Anchor Hours (NY time, 24h, comma-separated) -- 2/10/14 NY = 9am/5pm/9pm Israel time (IDT, UTC+3) in summer; the NY-Israel offset shifts to 6h or 8h for a few weeks around DST changeovers, so re-check it near late Mar / late Oct / early Nov", group = "Timeframes")
 sessionTimezone       = input.string("America/New_York", "Exchange Timezone", group = "Timeframes")
 entryWindowMinutes    = input.int(30, "Entry window length after each anchor (minutes)", minval = 1, group = "Timeframes")
 
@@ -58,7 +58,7 @@ requireNConfirmingCloses = input.int(1, "Require N consecutive confirming closes
 fixedRR               = input.float(2.0, "Fixed Risk:Reward (TP = entry +/- RR x risk)", minval = 0.1, step = 0.1, group = "Trade Management")
 contractsPerTrade     = input.int(1, "Contracts per trade", minval = 1, group = "Trade Management")
 
-sessionChoice         = input.string("New York", "Trading Session", options = ["New York", "Asia", "London", "All Day", "Custom"], group = "Filters")
+sessionChoice         = input.string("All Day", "Trading Session (leave All Day if your anchor hours already cover your desired times of day -- a continuous range like New York's 09:30-16:00 will exclude an anchor like 02:00 NY)", options = ["New York", "Asia", "London", "All Day", "Custom"], group = "Filters")
 customSessionInput    = input.session("0000-2359", "Custom session (used when Trading Session = Custom)", group = "Filters")
 skipMinutesAfterOpen  = input.int(0, "Skip first N minutes after session open", minval = 0, group = "Filters")
 maxTradesPerDay       = input.int(3, "Max trades per day", minval = 1, group = "Filters")
