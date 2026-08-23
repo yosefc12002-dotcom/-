@@ -1,0 +1,110 @@
+//@version=5
+// ============================================================================
+// ORB Half-Range Concept — כניסה על שבירת חצי מטווח הפתיחה (9:30 NY, 15 דק')
+//
+// רעיון: במקום לחכות לפריצה מלאה של ה-Opening Range (ORB רגיל), נכנסים
+// כשהמחיר שובר רק חצי מהמרחק בין אמצע הטווח ל-High/Low של הטווח.
+// זו כניסה מוקדמת ומהירה יותר מ-ORB קלאסי.
+//
+// פרמטרים היחידים שניתנים לשליטה: כמות חוזים ו-Risk:Reward.
+// כל השאר (אורך OR, סטופ באפר, מקסימום עסקאות ליום) קבוע בקוד.
+// ============================================================================
+strategy("ORB Half-Range Concept", overlay = true, initial_capital = 100000,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     calc_on_every_tick = true, process_orders_on_close = false)
+
+// ============================== קלט (2 בלבד) ================================
+qty = input.int(1, title = "כמות חוזים / מניות", minval = 1)
+rr  = input.float(2.0, title = "יחס Risk:Reward", minval = 0.1, step = 0.1)
+
+// ========================== קבועים - לא ניתנים לשינוי ========================
+NY_TZ           = "America/New_York"
+OR_SESSION      = "0930-0945:23456"   // 15 הדקות הראשונות אחרי 9:30, ימי מסחר בלבד
+TRADING_SESSION = "0930-1600:23456"   // חלון המסחר של היום (RTH)
+
+// ================================ מצב יומי ===================================
+inOrWindow      = not na(time(timeframe.period, OR_SESSION, NY_TZ))
+inTradingWindow = not na(time(timeframe.period, TRADING_SESSION, NY_TZ))
+newDay          = ta.change(time("D", timezone = NY_TZ))
+
+var float orHigh          = na
+var float orLow           = na
+var bool  orReady         = false
+var bool  tradeTakenToday = false
+
+var float entryLong  = na
+var float entryShort = na
+var float stopLong   = na
+var float stopShort  = na
+var float targetLong = na
+var float targetShort = na
+
+// איפוס בתחילת כל יום מסחר חדש
+if newDay
+    orHigh          := na
+    orLow           := na
+    orReady         := false
+    tradeTakenToday := false
+    entryLong       := na
+    entryShort      := na
+    stopLong        := na
+    stopShort       := na
+    targetLong      := na
+    targetShort     := na
+
+// בניית ה-Opening Range תוך כדי 15 הדקות הראשונות
+if inOrWindow
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow, low)
+
+// ברגע שהחלון של 15 הדקות נגמר - חישוב חד-פעמי של קווי הכניסה/סטופ/יעד
+orJustEnded = not inOrWindow and inOrWindow[1]
+if orJustEnded and not na(orHigh) and not na(orLow)
+    float orMid      = (orHigh + orLow) / 2
+    float halfRange  = (orHigh - orLow) / 2   // חצי מגובה הטווח המלא
+
+    // קו הכניסה = אמצע הטווח + חצי מהמרחק לקצה הטווח = 50% מהדרך אל ה-OR High/Low
+    entryLong  := orMid + halfRange * 0.5
+    entryShort := orMid - halfRange * 0.5
+
+    // הסטופ בצד השני של ה-OR המלא
+    stopLong  := orLow
+    stopShort := orHigh
+
+    // יעד לפי יחס Risk:Reward הנבחר
+    targetLong  := entryLong  + (entryLong  - stopLong)  * rr
+    targetShort := entryShort - (stopShort  - entryShort) * rr
+
+    orReady := true
+
+// ============================== כניסות לעסקה =================================
+canEnter = orReady and not tradeTakenToday and inTradingWindow and strategy.position_size == 0
+
+if canEnter
+    // שתי הזמנות סטופ הפוכות באותה קבוצת OCA - איזו שתופעל ראשונה תבטל את השנייה
+    strategy.entry("Long",  strategy.long,  qty = qty, stop = entryLong,  oca_name = "ORB_HALF", oca_type = strategy.oca.cancel)
+    strategy.entry("Short", strategy.short, qty = qty, stop = entryShort, oca_name = "ORB_HALF", oca_type = strategy.oca.cancel)
+
+// זיהוי הפעלת עסקה (מעבר מפוזיציה 0 לפוזיציה פתוחה) - מגביל לעסקה אחת ביום
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    tradeTakenToday := true
+
+// ================================ יציאות =====================================
+if strategy.position_size > 0
+    strategy.exit("Exit Long", from_entry = "Long", stop = stopLong, limit = targetLong, qty = qty)
+if strategy.position_size < 0
+    strategy.exit("Exit Short", from_entry = "Short", stop = stopShort, limit = targetShort, qty = qty)
+
+// ==== ביטול הזמנה שלא הופעלה עד סוף היום (רק אם עדיין אין פוזיציה פתוחה) ====
+sessionJustEnded = not inTradingWindow and inTradingWindow[1]
+if sessionJustEnded and strategy.position_size == 0
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+
+// ================================= ציור על הגרף ===============================
+plot(orReady ? orHigh    : na, title = "OR High",          color = color.new(color.gray, 0),   style = plot.style_stepline)
+plot(orReady ? orLow     : na, title = "OR Low",           color = color.new(color.gray, 0),   style = plot.style_stepline)
+plot(orReady ? entryLong : na, title = "Entry Long (½)",   color = color.new(color.green, 0),  style = plot.style_stepline, linewidth = 2)
+plot(orReady ? entryShort: na, title = "Entry Short (½)",  color = color.new(color.red, 0),    style = plot.style_stepline, linewidth = 2)
+plot(orReady ? targetLong: na, title = "Target Long",      color = color.new(color.green, 60), style = plot.style_stepline)
+plot(orReady ? targetShort:na, title = "Target Short",     color = color.new(color.red, 60),   style = plot.style_stepline)
