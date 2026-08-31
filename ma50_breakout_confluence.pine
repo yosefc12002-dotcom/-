@@ -1,0 +1,91 @@
+//@version=5
+// MA50 Breakout + Confluence
+// Enters only when a MA50 crossover/crossunder is confirmed by ALL of:
+// volume > SMA(volume) * multiplier, a defined trading-session window,
+// candle body > its average (strong, non-doji breakout candle), and
+// price breaking through a round-number level. Fixed 1:2 risk:reward,
+// ATR-based stop, max one trade per day.
+strategy("MA50 Breakout + Confluence", overlay = true,
+     initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 100,
+     pyramiding = 0,
+     calc_on_order_fills = false,
+     process_orders_on_close = true)
+
+// ---- Inputs ----
+maLength         = input.int(50, title = "MA50 Length", group = "Moving Average")
+
+volAvgLength     = input.int(20, title = "Volume SMA Length", group = "Volume Confirmation")
+volMultiplier    = input.float(1.2, title = "Volume Multiplier (x SMA)", minval = 0.1, step = 0.1, group = "Volume Confirmation")
+
+sessionWindow    = input.session("0930-1600", title = "Trading Session Window", group = "Session Filter")
+sessionTimezone  = input.string("America/New_York", title = "Session Timezone", group = "Session Filter")
+
+bodyLookback     = input.int(20, title = "Candle Body Average Length", group = "Momentum Filter")
+bodyMultiplier   = input.float(1.0, title = "Body Size Multiplier (x average)", minval = 0.1, step = 0.1, group = "Momentum Filter")
+
+roundStep        = input.float(50.0, title = "Round Number Step", minval = 0.01, group = "Round Number Filter")
+roundProximity   = input.float(10.0, title = "Max Distance From Round Level", minval = 0, group = "Round Number Filter")
+
+atrLength        = input.int(14, title = "ATR Length", group = "Risk Management")
+atrMultiplier    = input.float(1.5, title = "ATR Stop Multiplier", minval = 0.1, step = 0.1, group = "Risk Management")
+riskRewardRatio  = input.float(2.0, title = "Risk:Reward Ratio", minval = 0.1, step = 0.1, group = "Risk Management")
+
+// ---- Indicators ----
+ma50   = ta.sma(close, maLength)
+volSma = ta.sma(volume, volAvgLength)
+atrVal = ta.atr(atrLength)
+
+bodySize    = math.abs(close - open)
+avgBodySize = ta.sma(bodySize, bodyLookback)
+
+nearestRound = math.round(close / roundStep) * roundStep
+roundDist    = math.abs(close - nearestRound)
+
+// ---- Confluence conditions ----
+inSession   = not na(time(timeframe.period, sessionWindow, sessionTimezone))
+volOk       = volume > volSma * volMultiplier
+momentumOk  = bodySize > avgBodySize * bodyMultiplier
+roundOk     = roundDist <= roundProximity
+
+crossUp   = ta.crossover(close, ma50)
+crossDown = ta.crossunder(close, ma50)
+
+// one trade per day
+currentDayStart = time("D")
+var float lastTradeDay = na
+tradedToday = not na(lastTradeDay) and lastTradeDay == currentDayStart
+
+longSetup  = crossUp   and volOk and inSession and momentumOk and roundOk and close > open and not tradedToday
+shortSetup = crossDown and volOk and inSession and momentumOk and roundOk and close < open and not tradedToday
+
+// ---- Orders ----
+var float longStop  = na
+var float longTp    = na
+var float shortStop = na
+var float shortTp   = na
+
+if longSetup
+    longStop := close - atrVal * atrMultiplier
+    longTp   := close + (close - longStop) * riskRewardRatio
+    strategy.entry("Long", strategy.long)
+    lastTradeDay := currentDayStart
+
+if shortSetup
+    shortStop := close + atrVal * atrMultiplier
+    shortTp   := close - (shortStop - close) * riskRewardRatio
+    strategy.entry("Short", strategy.short)
+    lastTradeDay := currentDayStart
+
+strategy.exit("Long Exit", from_entry = "Long", stop = longStop, limit = longTp)
+strategy.exit("Short Exit", from_entry = "Short", stop = shortStop, limit = shortTp)
+
+// ---- Visuals ----
+plot(ma50, title = "MA50", color = color.orange, linewidth = 2)
+bgcolor(inSession ? color.new(color.blue, 95) : na, title = "Session Window")
+plotshape(longSetup, title = "Long Signal", style = shape.triangleup, location = location.belowbar, color = color.green, size = size.small)
+plotshape(shortSetup, title = "Short Signal", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.small)
+
+alertcondition(longSetup, title = "MA50 Breakout Long", message = "MA50 Breakout + Confluence: LONG signal")
+alertcondition(shortSetup, title = "MA50 Breakout Short", message = "MA50 Breakout + Confluence: SHORT signal")
