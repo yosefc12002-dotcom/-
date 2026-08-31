@@ -32,6 +32,9 @@ atrLength        = input.int(14, title = "ATR Length", group = "Risk Management"
 atrMultiplier    = input.float(1.5, title = "ATR Stop Multiplier", minval = 0.1, step = 0.1, group = "Risk Management")
 riskRewardRatio  = input.float(2.0, title = "Risk:Reward Ratio", minval = 0.1, step = 0.1, group = "Risk Management")
 
+assetClass    = input.string("Futures", title = "Asset Class (for webhook bot)", options = ["Futures", "Crypto"], group = "Automation / Webhook")
+webhookSecret = input.string("changeme", title = "Webhook Secret (must match bot server)", group = "Automation / Webhook")
+
 // ---- Indicators ----
 ma50   = ta.sma(close, maLength)
 volSma = ta.sma(volume, volAvgLength)
@@ -71,12 +74,16 @@ if longSetup
     longTp   := close + (close - longStop) * riskRewardRatio
     strategy.entry("Long", strategy.long)
     lastTradeDay := currentDayStart
+    longMsg = '{"secret":"' + webhookSecret + '","strategy":"MA50_Breakout_Confluence","market":"' + assetClass + '","symbol":"' + syminfo.ticker + '","side":"buy","price":' + str.tostring(close) + ',"stop":' + str.tostring(longStop) + ',"take_profit":' + str.tostring(longTp) + '}'
+    alert(longMsg, alert.freq_once_per_bar_close)
 
 if shortSetup
     shortStop := close + atrVal * atrMultiplier
     shortTp   := close - (shortStop - close) * riskRewardRatio
     strategy.entry("Short", strategy.short)
     lastTradeDay := currentDayStart
+    shortMsg = '{"secret":"' + webhookSecret + '","strategy":"MA50_Breakout_Confluence","market":"' + assetClass + '","symbol":"' + syminfo.ticker + '","side":"sell","price":' + str.tostring(close) + ',"stop":' + str.tostring(shortStop) + ',"take_profit":' + str.tostring(shortTp) + '}'
+    alert(shortMsg, alert.freq_once_per_bar_close)
 
 strategy.exit("Long Exit", from_entry = "Long", stop = longStop, limit = longTp)
 strategy.exit("Short Exit", from_entry = "Short", stop = shortStop, limit = shortTp)
