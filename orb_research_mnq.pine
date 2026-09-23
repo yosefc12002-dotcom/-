@@ -1,0 +1,152 @@
+//@version=5
+indicator("ORB Research - MNQ", overlay=true, max_labels_count=5)
+// Opening Range Breakout research tool. Put it on a 15-minute MNQ chart.
+// The whole simulation runs on 5-minute data inside each chart bar, so it does NOT
+// depend on Bar Magnifier. It tests 9 Stop/Target combinations at once and prints
+// the results in a box on the last bar. Results are per 1 contract, after commission
+// and slippage. When stop and target are touched in the same 5-minute bar, it is
+// counted as a LOSS (pessimistic), so real results should be the same or better.
+
+orMinutes = input.int(15, "Opening range length (minutes from 09:30 NY)", minval=5, step=5)
+lastEntry = input.int(1100, "No new entries after (HHMM, NY time)")
+flatTime  = input.int(1555, "Flatten open trade at (HHMM, NY time)")
+bufTicks  = input.int(1, "Breakout buffer (ticks)", minval=0)
+slipTicks = input.int(2, "Slippage per market fill (ticks)", minval=0)
+commSide  = input.float(0.62, "Commission per contract per side (USD)", minval=0)
+ltfTf     = input.timeframe("5", "Simulation data timeframe")
+
+NY = "America/New_York"
+tk = syminfo.mintick
+pv = syminfo.pointvalue
+
+// 9 combinations: stop in ticks x reward multiple
+var stopsArr = array.from(40, 60, 80)
+var rrArr    = array.from(1.0, 2.0, 3.0)
+var posDir   = array.new_int(9, 0)
+var entryPx  = array.new_float(9, na)
+var nTr      = array.new_int(9, 0)
+var nWin     = array.new_int(9, 0)
+var netAll   = array.new_float(9, 0.0)
+var netOld   = array.new_float(9, 0.0)
+var netNew   = array.new_float(9, 0.0)
+
+var int   dayId       = na
+var float orHi        = na
+var float orLo        = na
+var bool  tradedToday = false
+var int   firstData   = na
+var float lastClose   = na
+var int   skipDays    = 0
+var int   ambigExits  = 0
+
+// Split point for the robustness check: last ~3 months vs. everything before.
+splitTime = timenow - 91 * 86400000
+
+aT = request.security_lower_tf(syminfo.tickerid, ltfTf, time)
+aO = request.security_lower_tf(syminfo.tickerid, ltfTf, open)
+aH = request.security_lower_tf(syminfo.tickerid, ltfTf, high)
+aL = request.security_lower_tf(syminfo.tickerid, ltfTf, low)
+aC = request.security_lower_tf(syminfo.tickerid, ltfTf, close)
+
+f_book(int k, float pnl, int t) =>
+    array.set(nTr, k, array.get(nTr, k) + 1)
+    if pnl > 0
+        array.set(nWin, k, array.get(nWin, k) + 1)
+    array.set(netAll, k, array.get(netAll, k) + pnl)
+    if t < splitTime
+        array.set(netOld, k, array.get(netOld, k) + pnl)
+    else
+        array.set(netNew, k, array.get(netNew, k) + pnl)
+    array.set(posDir, k, 0)
+
+f_exitPnl(int xDir, float ep, float fill) =>
+    (fill - ep) * xDir * pv - slipTicks * tk * pv - 2 * commSide
+
+nBars = array.size(aT)
+if nBars > 0
+    for i = 0 to nBars - 1
+        t  = array.get(aT, i)
+        o  = array.get(aO, i)
+        h  = array.get(aH, i)
+        l  = array.get(aL, i)
+        c  = array.get(aC, i)
+        if na(firstData)
+            firstData := t
+        d    = year(t, NY) * 10000 + month(t, NY) * 100 + dayofmonth(t, NY)
+        mins = hour(t, NY) * 60 + minute(t, NY)
+        hm   = hour(t, NY) * 100 + minute(t, NY)
+
+        // New day: close anything still open at the previous close, reset the range
+        if na(dayId) or d != dayId
+            for k = 0 to 8
+                if array.get(posDir, k) != 0
+                    f_book(k, f_exitPnl(array.get(posDir, k), array.get(entryPx, k), lastClose), t)
+            dayId       := d
+            orHi        := na
+            orLo        := na
+            tradedToday := false
+
+        // Exits (stop first if both are touched in the same bar)
+        for k = 0 to 8
+            xDir = array.get(posDir, k)
+            if xDir != 0
+                ep    = array.get(entryPx, k)
+                sT    = array.get(stopsArr, math.floor(k / 3))
+                slD   = sT * tk
+                tpD   = slD * array.get(rrArr, k % 3)
+                sl    = ep - xDir * slD
+                tp    = ep + xDir * tpD
+                sHit  = xDir == 1 ? l <= sl : h >= sl
+                tHit  = xDir == 1 ? h >= tp : l <= tp
+                if sHit
+                    if tHit
+                        ambigExits += 1
+                    fillS = xDir == 1 ? math.min(o, sl) : math.max(o, sl)
+                    f_book(k, f_exitPnl(xDir, ep, fillS), t)
+                else if tHit
+                    f_book(k, tpD * pv - 2 * commSide, t)
+                else if hm >= flatTime
+                    f_book(k, f_exitPnl(xDir, ep, c), t)
+
+        // Build the opening range, then look for the first breakout of the day
+        if mins >= 570 and mins < 570 + orMinutes
+            orHi := na(orHi) ? h : math.max(orHi, h)
+            orLo := na(orLo) ? l : math.min(orLo, l)
+        else if mins >= 570 + orMinutes and hm < lastEntry and not tradedToday and not na(orHi)
+            upLvl = orHi + bufTicks * tk
+            dnLvl = orLo - bufTicks * tk
+            upHit = h >= upLvl
+            dnHit = l <= dnLvl
+            if upHit and dnHit
+                skipDays    += 1
+                tradedToday := true
+            else if upHit or dnHit
+                eDir = upHit ? 1 : -1
+                px   = (upHit ? math.max(o, upLvl) : math.min(o, dnLvl)) + eDir * slipTicks * tk
+                for k = 0 to 8
+                    array.set(posDir, k, eDir)
+                    array.set(entryPx, k, px)
+                    // Pessimistic: if this same bar also reached the stop, count it as stopped out
+                    slE = px - eDir * array.get(stopsArr, math.floor(k / 3)) * tk
+                    if eDir == 1 ? l <= slE : h >= slE
+                        f_book(k, f_exitPnl(eDir, px, slE), t)
+                tradedToday := true
+        lastClose := c
+
+// Results box
+var label resBox = na
+if barstate.islast
+    label.delete(resBox)
+    string txt = "ORB " + str.tostring(orMinutes) + "min | per 1 contract | data from " + (na(firstData) ? "-" : str.format_time(firstData, "yyyy-MM-dd", NY)) + "\n"
+    txt += "old = before " + str.format_time(splitTime, "yyyy-MM-dd", NY) + " | new = after\n\n"
+    for k = 0 to 8
+        sT   = array.get(stopsArr, math.floor(k / 3))
+        tpT  = math.round(sT * array.get(rrArr, k % 3))
+        tr   = array.get(nTr, k)
+        wp   = tr > 0 ? 100.0 * array.get(nWin, k) / tr : 0.0
+        nOld = array.get(netOld, k)
+        nNew = array.get(netNew, k)
+        ok   = nOld > 0 and nNew > 0 ? "   <-- OK" : ""
+        txt += "#" + str.tostring(k + 1) + "  SL " + str.tostring(sT) + " / TP " + str.tostring(tpT) + " | trades " + str.tostring(tr) + " | win " + str.tostring(wp, "#") + "% | net $" + str.tostring(array.get(netAll, k), "#") + " | old $" + str.tostring(nOld, "#") + " | new $" + str.tostring(nNew, "#") + ok + "\n"
+    txt += "\nskipped days (broke both sides in one bar): " + str.tostring(skipDays) + " | stop+target same bar (counted as loss): " + str.tostring(ambigExits)
+    resBox := label.new(bar_index, high, txt, style=label.style_label_right, color=color.white, textcolor=color.black, textalign=text.align_left, size=size.normal)
