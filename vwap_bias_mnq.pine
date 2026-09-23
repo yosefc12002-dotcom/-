@@ -19,6 +19,9 @@ pmtEnabled   = input.bool(true, "Enable PickMyTrade Alerts", group="PickMyTrade 
 pmtPlatform  = input.string("RITHMIC", "Platform", options=["RITHMIC", "TRADOVATE", "PROJECTX", "TRADESTATION", "TRADELOCKER"], group="PickMyTrade - General")
 pmtSymbolOverride = input.string("", "Symbol Override (blank = chart symbol) - MUST be the exact active contract, e.g. MNQZ2026", group="PickMyTrade - General")
 pmtReverseClose   = input.bool(true, "Close opposite broker position before a new entry (reverse_order_close)", group="PickMyTrade - General")
+pmtSendBracket    = input.bool(false, "Send TP/SL prices in alert (off = TP/SL set in PickMyTrade)", group="PickMyTrade - General")
+// IMPORTANT: when TP/SL come from PickMyTrade, set Stop/Target ticks above to the SAME values,
+// otherwise the strategy's position/trade count/daily P&L will drift from the broker.
 
 // --- Account 1 ---
 acc1Enabled = input.bool(true, "Enable Account 1", group="PickMyTrade - Account 1")
@@ -158,14 +161,14 @@ if canEnter
         strategy.entry("Long", strategy.long, qty=qty)
         strategy.exit("Long Exit", from_entry="Long", stop=stopPrice, limit=targetPrice)
         if pmtEnabled
-            alert(f_buildOrderJson("buy", qty, targetPrice, stopPrice), alert.freq_once_per_bar_close)
+            alert(f_buildOrderJson("buy", qty, pmtSendBracket ? targetPrice : 0, pmtSendBracket ? stopPrice : 0), alert.freq_once_per_bar_close)
     else if close < vwapValue
         stopPrice   = close + stopTicks * tickSize
         targetPrice = close - targetTicks * tickSize
         strategy.entry("Short", strategy.short, qty=qty)
         strategy.exit("Short Exit", from_entry="Short", stop=stopPrice, limit=targetPrice)
         if pmtEnabled
-            alert(f_buildOrderJson("sell", qty, targetPrice, stopPrice), alert.freq_once_per_bar_close)
+            alert(f_buildOrderJson("sell", qty, pmtSendBracket ? targetPrice : 0, pmtSendBracket ? stopPrice : 0), alert.freq_once_per_bar_close)
 
 // ===== UNIFIED FORCED-CLOSE LOGIC =====
 // SYNC: forced exits send "close" (flatten + cancel bracket) instead of an opposite buy/sell,
