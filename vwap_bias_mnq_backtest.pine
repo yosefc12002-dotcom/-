@@ -122,12 +122,22 @@ if flattenOn and not na(time(timeframe.period, flattenStr, NY_TZ)) and strategy.
     strategy.close_all(comment="EOD Flatten")
 
 // ===== PLOTTING =====
-plot(vwapValue, title="VWAP", color=color.new(color.blue, 0), linewidth=2)
-plotshape(longSig,  title="Buy signal",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small)
-plotshape(shortSig, title="Sell signal", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small)
+plot(vwapValue, title="VWAP", color=color.new(color.blue, 0), linewidth=2, display=display.pane)
+plotshape(longSig,  title="Buy signal",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small, display=display.pane)
+plotshape(shortSig, title="Sell signal", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small, display=display.pane)
+
+// Stats shown next to the script name on the chart (status line), in this order:
+// Trades | Win% pessimistic | Net pessimistic | Net optimistic | Max DD pessimistic | Ambiguous trades
+statsDisp = display.status_line + display.data_window
+plot(simTrades, "Trades", color=color.gray, display=statsDisp)
+plot(simTrades > 0 ? 100.0 * simWinsP / simTrades : na, "Win% (pessimistic)", color=color.orange, display=statsDisp)
+plot(simNetP, "Net USD (pessimistic)", color=color.red, display=statsDisp)
+plot(simNetO, "Net USD (optimistic)", color=color.green, display=statsDisp)
+plot(simDDP, "Max DD USD (pessimistic)", color=color.purple, display=statsDisp)
+plot(simAmbig, "Ambiguous trades", color=color.blue, display=statsDisp)
 
 // ===== HONEST STATS TABLE =====
-var table st = table.new(position.top_right, 3, 6, border_width=1)
+var table st = table.new(position.bottom_left, 3, 6, border_width=1, bgcolor=color.new(color.white, 0), frame_color=color.gray, frame_width=1)
 if barstate.islast
     table.cell(st, 0, 0, "", bgcolor=color.gray)
     table.cell(st, 1, 0, "Pessimistic", bgcolor=color.gray, text_color=color.white)
