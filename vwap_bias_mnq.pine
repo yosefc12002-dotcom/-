@@ -1,0 +1,218 @@
+//@version=5
+strategy("VWAP Directional Bias - Max 2 Trades - MNQ", overlay=true, default_qty_type=strategy.fixed, initial_capital=10000, currency=currency.USD, process_orders_on_close=true, calc_on_every_tick=false, use_bar_magnifier=true, commission_type=strategy.commission.cash_per_contract, commission_value=0.62, slippage=2, backtest_fill_limits_assumption=0)
+// SYNC: use_bar_magnifier=true makes historical TP/SL fills use lower-timeframe data (closer to what the broker really does).
+// SYNC: calc_on_every_tick=false (explicit) - entries and alerts fire only on bar close, same as the backtest.
+
+// ===== USER INPUTS =====
+qty          = input.int(1, "Trade Quantity", minval=1, group="Trade Settings")
+stopTicks    = input.int(10, "Stop Distance (ticks)", minval=1, group="Trade Settings")
+targetTicks  = input.int(10, "Target Distance (ticks)", minval=1, group="Trade Settings")
+
+flattenWindowStr = input.session("1555-1600", "End-of-Day Flatten Window (NY time)", group="Risk Management")
+entryWindowStr   = input.session("0930-1550", "New Entries Allowed (NY time)", group="Risk Management")
+maxTradesPerDay  = input.int(2, "Max Trades Per Day", minval=1, group="Risk Management")
+dailyLossLimit   = input.float(150, "Daily Loss Limit (USD, 0=off)", minval=0, group="Risk Management")
+maxLossPerTrade  = input.float(300, "Hard Max Loss Per Trade (USD, 0=off)", minval=0, group="Risk Management")
+
+// ===== PICKMYTRADE AUTOMATION SETTINGS =====
+pmtEnabled   = input.bool(true, "Enable PickMyTrade Alerts", group="PickMyTrade - General")
+pmtPlatform  = input.string("RITHMIC", "Platform", options=["RITHMIC", "TRADOVATE", "PROJECTX", "TRADESTATION", "TRADELOCKER"], group="PickMyTrade - General")
+pmtSymbolOverride = input.string("", "Symbol Override (blank = chart symbol) - MUST be the exact active contract, e.g. MNQZ2026", group="PickMyTrade - General")
+pmtReverseClose   = input.bool(true, "Close opposite broker position before a new entry (reverse_order_close)", group="PickMyTrade - General")
+
+// --- Account 1 ---
+acc1Enabled = input.bool(true, "Enable Account 1", group="PickMyTrade - Account 1")
+acc1Token   = input.string("", "Token", group="PickMyTrade - Account 1")
+acc1Id      = input.string("", "Account ID", group="PickMyTrade - Account 1")
+acc1Conn    = input.string("", "Connection Name", group="PickMyTrade - Account 1")
+acc1Qty     = input.float(1.0, "Quantity Multiplier", minval=0.0, step=0.1, group="PickMyTrade - Account 1")
+
+// --- Account 2 ---
+acc2Enabled = input.bool(false, "Enable Account 2", group="PickMyTrade - Account 2")
+acc2Token   = input.string("", "Token", group="PickMyTrade - Account 2")
+acc2Id      = input.string("", "Account ID", group="PickMyTrade - Account 2")
+acc2Conn    = input.string("", "Connection Name", group="PickMyTrade - Account 2")
+acc2Qty     = input.float(1.0, "Quantity Multiplier", minval=0.0, step=0.1, group="PickMyTrade - Account 2")
+
+// --- Account 3 ---
+acc3Enabled = input.bool(false, "Enable Account 3", group="PickMyTrade - Account 3")
+acc3Token   = input.string("", "Token", group="PickMyTrade - Account 3")
+acc3Id      = input.string("", "Account ID", group="PickMyTrade - Account 3")
+acc3Conn    = input.string("", "Connection Name", group="PickMyTrade - Account 3")
+acc3Qty     = input.float(1.0, "Quantity Multiplier", minval=0.0, step=0.1, group="PickMyTrade - Account 3")
+
+// --- Account 4 ---
+acc4Enabled = input.bool(false, "Enable Account 4", group="PickMyTrade - Account 4")
+acc4Token   = input.string("", "Token", group="PickMyTrade - Account 4")
+acc4Id      = input.string("", "Account ID", group="PickMyTrade - Account 4")
+acc4Conn    = input.string("", "Connection Name", group="PickMyTrade - Account 4")
+acc4Qty     = input.float(1.0, "Quantity Multiplier", minval=0.0, step=0.1, group="PickMyTrade - Account 4")
+
+// --- Account 5 ---
+acc5Enabled = input.bool(false, "Enable Account 5", group="PickMyTrade - Account 5")
+acc5Token   = input.string("", "Token", group="PickMyTrade - Account 5")
+acc5Id      = input.string("", "Account ID", group="PickMyTrade - Account 5")
+acc5Conn    = input.string("", "Connection Name", group="PickMyTrade - Account 5")
+acc5Qty     = input.float(1.0, "Quantity Multiplier", minval=0.0, step=0.1, group="PickMyTrade - Account 5")
+
+// ===== FIXED SETTINGS =====
+NY_TZ       = "America/New_York"
+RTH_SESSION = "0930-1600"
+tickSize    = syminfo.mintick   // SYNC: take tick size from the symbol instead of hard-coding 0.25
+
+// ===== SESSION FILTER =====
+inRTH         = not na(time(timeframe.period, RTH_SESSION, NY_TZ))
+inEntryWindow = not na(time(timeframe.period, entryWindowStr, NY_TZ))
+
+// ===== ROBUST NEW-DAY DETECTION (composite date ID) =====
+dateId = year(time, NY_TZ) * 10000 + month(time, NY_TZ) * 100 + dayofmonth(time, NY_TZ)
+var int prevDateId = na
+newDay = na(prevDateId) or dateId != prevDateId
+prevDateId := dateId
+
+// ===== VWAP (daily reset) =====
+[vwapValue, _u, _l] = ta.vwap(hlc3, newDay, 1)
+
+// ===== DAILY STATE TRACKING =====
+var int   tradesToday      = 0
+var float dailyPnL         = 0.0
+var bool  dayLocked        = false
+var int   prevClosedTrades = 0
+
+if newDay
+    tradesToday := 0
+    dailyPnL    := 0.0
+    dayLocked   := false
+
+if strategy.closedtrades > prevClosedTrades
+    // SYNC: count every trade closed since the last bar, not only the last one
+    for i = prevClosedTrades to strategy.closedtrades - 1
+        tradesToday := tradesToday + 1
+        dailyPnL    := dailyPnL + strategy.closedtrades.profit(i)
+    prevClosedTrades := strategy.closedtrades
+    if tradesToday >= maxTradesPerDay
+        dayLocked := true
+    if dailyLossLimit > 0 and dailyPnL <= -dailyLossLimit
+        dayLocked := true
+
+// ===== REAL-TIME DAILY LOSS LIMIT (includes open position unrealized P&L) =====
+openPnL      = strategy.opentrades > 0 ? strategy.openprofit : 0.0
+runningDaily = dailyPnL + openPnL
+
+// ===== PICKMYTRADE - JSON BUILDER HELPERS =====
+f_pmtSymbol() =>
+    pmtSymbolOverride == "" ? syminfo.ticker : pmtSymbolOverride
+
+f_primaryToken() =>
+    string tok = ""
+    if acc1Enabled
+        tok := acc1Token
+    else if acc2Enabled
+        tok := acc2Token
+    else if acc3Enabled
+        tok := acc3Token
+    else if acc4Enabled
+        tok := acc4Token
+    else if acc5Enabled
+        tok := acc5Token
+    tok
+
+f_accObj(tok, accId, conn, qtyMult) =>
+    '{"token":"' + tok + '","account_id":"' + accId + '","connection_name":"' + conn + '","risk_percentage":0,"quantity_multiplier":' + str.tostring(qtyMult) + '}'
+
+f_buildAccountsArray() =>
+    string result = ""
+    if acc1Enabled
+        result := result + f_accObj(acc1Token, acc1Id, acc1Conn, acc1Qty)
+    if acc2Enabled
+        result := (result == "" ? result : result + ",") + f_accObj(acc2Token, acc2Id, acc2Conn, acc2Qty)
+    if acc3Enabled
+        result := (result == "" ? result : result + ",") + f_accObj(acc3Token, acc3Id, acc3Conn, acc3Qty)
+    if acc4Enabled
+        result := (result == "" ? result : result + ",") + f_accObj(acc4Token, acc4Id, acc4Conn, acc4Qty)
+    if acc5Enabled
+        result := (result == "" ? result : result + ",") + f_accObj(acc5Token, acc5Id, acc5Conn, acc5Qty)
+    result
+
+// Builds a full PickMyTrade order JSON message.
+// side: "buy" / "sell" for entries, "close" to flatten the broker position (and cancel its TP/SL bracket).
+f_buildOrderJson(side, orderQty, tpPrice, slPrice) =>
+    accountsArr = f_buildAccountsArray()
+    '{"symbol":"' + f_pmtSymbol() + '","date":"{{timenow}}","data":"' + side +
+     '","quantity":' + str.tostring(orderQty) +
+     ',"risk_percentage":0,"price":"' + str.tostring(close, format.mintick) + '","tp":' + str.tostring(tpPrice, format.mintick) +
+     ',"sl":' + str.tostring(slPrice, format.mintick) +
+     ',"order_type":"MKT","update_tp":false,"update_sl":false,"token":"' + f_primaryToken() +
+     '","duplicate_position_allow":false,"platform":"' + pmtPlatform +
+     '","reverse_order_close":' + (pmtReverseClose ? 'true' : 'false') +
+     ',"account_id":"","multiple_accounts":[' + accountsArr + ']}'
+
+// ===== ENTRY LOGIC (directional bias relative to VWAP, max N/day) =====
+// SYNC: no new entries inside the flatten window (previously a trade could open at 15:55 and be flattened one bar later)
+canEnter = inRTH and inEntryWindow and not dayLocked and strategy.opentrades == 0 and barstate.isconfirmed
+
+if canEnter
+    if close > vwapValue
+        stopPrice   = close - stopTicks * tickSize
+        targetPrice = close + targetTicks * tickSize
+        strategy.entry("Long", strategy.long, qty=qty)
+        strategy.exit("Long Exit", from_entry="Long", stop=stopPrice, limit=targetPrice)
+        if pmtEnabled
+            alert(f_buildOrderJson("buy", qty, targetPrice, stopPrice), alert.freq_once_per_bar_close)
+    else if close < vwapValue
+        stopPrice   = close + stopTicks * tickSize
+        targetPrice = close - targetTicks * tickSize
+        strategy.entry("Short", strategy.short, qty=qty)
+        strategy.exit("Short Exit", from_entry="Short", stop=stopPrice, limit=targetPrice)
+        if pmtEnabled
+            alert(f_buildOrderJson("sell", qty, targetPrice, stopPrice), alert.freq_once_per_bar_close)
+
+// ===== UNIFIED FORCED-CLOSE LOGIC =====
+// SYNC: forced exits send "close" (flatten + cancel bracket) instead of an opposite buy/sell,
+// which could open a reverse position or leave orphan TP/SL orders at the broker.
+hardLossHit  = maxLossPerTrade > 0 and strategy.opentrades > 0 and strategy.openprofit <= -maxLossPerTrade
+dailyLossHit = dailyLossLimit > 0 and runningDaily <= -dailyLossLimit and strategy.opentrades > 0
+
+if hardLossHit
+    if pmtEnabled
+        alert(f_buildOrderJson("close", math.abs(strategy.position_size), 0, 0), alert.freq_once_per_bar_close)
+    strategy.close_all(comment="Hard Max Loss Per Trade Hit")
+else if dailyLossHit
+    if pmtEnabled
+        alert(f_buildOrderJson("close", math.abs(strategy.position_size), 0, 0), alert.freq_once_per_bar_close)
+    strategy.close_all(comment="Daily Loss Limit Hit")
+    dayLocked := true
+
+// ===== END-OF-DAY FLATTEN =====
+inFlattenWindow = not na(time(timeframe.period, flattenWindowStr, NY_TZ))
+if inFlattenWindow and strategy.opentrades > 0 and not hardLossHit and not dailyLossHit
+    if pmtEnabled
+        alert(f_buildOrderJson("close", math.abs(strategy.position_size), 0, 0), alert.freq_once_per_bar_close)
+    strategy.close_all(comment="EOD Flatten")
+
+// ===== DIAGNOSTIC TABLE =====
+var table diagTable = table.new(position.top_right, 2, 10, border_width=1)
+if barstate.islast
+    table.cell(diagTable, 0, 0, "Metric", bgcolor=color.gray, text_color=color.white)
+    table.cell(diagTable, 1, 0, "Value", bgcolor=color.gray, text_color=color.white)
+    table.cell(diagTable, 0, 1, "VWAP")
+    table.cell(diagTable, 1, 1, str.tostring(vwapValue, "#.##"))
+    table.cell(diagTable, 0, 2, "Trades Today")
+    table.cell(diagTable, 1, 2, str.tostring(tradesToday))
+    table.cell(diagTable, 0, 3, "Closed Daily PnL")
+    table.cell(diagTable, 1, 3, str.tostring(dailyPnL, "#.##"))
+    table.cell(diagTable, 0, 4, "Open Position PnL")
+    table.cell(diagTable, 1, 4, str.tostring(openPnL, "#.##"))
+    table.cell(diagTable, 0, 5, "Running Daily Total")
+    table.cell(diagTable, 1, 5, str.tostring(runningDaily, "#.##"))
+    table.cell(diagTable, 0, 6, "Day Locked")
+    table.cell(diagTable, 1, 6, str.tostring(dayLocked))
+    table.cell(diagTable, 0, 7, "In RTH")
+    table.cell(diagTable, 1, 7, str.tostring(inRTH))
+    table.cell(diagTable, 0, 8, "PMT Symbol Sent")
+    table.cell(diagTable, 1, 8, f_pmtSymbol(), bgcolor = pmtSymbolOverride == "" ? color.new(color.orange, 0) : na)
+    table.cell(diagTable, 0, 9, "TV Position")
+    table.cell(diagTable, 1, 9, str.tostring(strategy.position_size))
+
+// ===== PLOTTING =====
+plot(vwapValue, title="VWAP", color=color.new(color.blue, 0), linewidth=2)
