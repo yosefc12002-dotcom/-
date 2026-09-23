@@ -1,5 +1,5 @@
 //@version=5
-strategy("VWAP Bias Signals - Backtest (PMT bracket sim) - MNQ", overlay=true, default_qty_type=strategy.fixed, default_qty_value=1, initial_capital=10000, currency=currency.USD, process_orders_on_close=true, use_bar_magnifier=true, commission_type=strategy.commission.cash_per_contract, commission_value=0.62, slippage=2)
+strategy("VWAP Bias Backtest v2 - MNQ", overlay=true, default_qty_type=strategy.fixed, default_qty_value=20, initial_capital=10000, currency=currency.USD, process_orders_on_close=true, use_bar_magnifier=true, commission_type=strategy.commission.cash_per_contract, commission_value=0.62, slippage=4)
 // Backtest-only copy of the entry-signal indicator.
 // Signals are generated exactly like the live indicator; the TP/SL bracket that
 // PickMyTrade places is simulated here so the Strategy Tester can show win rate.
@@ -8,16 +8,16 @@ strategy("VWAP Bias Signals - Backtest (PMT bracket sim) - MNQ", overlay=true, d
 
 // ===== SIGNAL SETTINGS (keep identical to the live indicator) =====
 entryWindowStr    = input.session("0930-1550", "Signals Allowed (NY time)", group="Signal Settings")
-maxSignalsPerDay  = input.int(2, "Max Entry Signals Per Day (0 = unlimited)", minval=0, group="Signal Settings")
+maxSignalsPerDay  = input.int(1, "Max Entry Signals Per Day (0 = unlimited)", minval=0, group="Signal Settings")
 signalMode        = input.string("VWAP cross", "Send signal on", options=["VWAP cross", "Every bar"], group="Signal Settings")
 
 // ===== PICKMYTRADE BRACKET (keep identical to PickMyTrade) =====
-qty         = input.int(1, "Contracts", minval=1, group="PickMyTrade Bracket")
-stopTicks   = input.int(8, "Stop Loss (ticks)", minval=1, group="PickMyTrade Bracket")
-targetTicks = input.int(50, "Take Profit (ticks)", minval=1, group="PickMyTrade Bracket")
+qty         = input.int(20, "Contracts", minval=1, group="PickMyTrade Bracket")
+stopTicks   = input.int(20, "Stop Loss (ticks)", minval=1, group="PickMyTrade Bracket")
+targetTicks = input.int(80, "Take Profit (ticks)", minval=1, group="PickMyTrade Bracket")
 flattenOn   = input.bool(false, "Flatten at end of day", group="PickMyTrade Bracket")
 flattenStr  = input.session("1555-1600", "Flatten window (NY time)", group="PickMyTrade Bracket")
-simSlip     = input.int(2, "Slippage for stats table (ticks, keep = Properties > Slippage)", minval=0, group="Honest Stats Table")
+simSlip     = input.int(4, "Slippage for stats table (ticks, keep = Properties > Slippage)", minval=0, group="Honest Stats Table")
 simComm     = input.float(0.62, "Commission per contract per side (USD)", minval=0, group="Honest Stats Table")
 
 NY_TZ = "America/New_York"
