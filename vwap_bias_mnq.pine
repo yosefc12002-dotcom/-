@@ -1,0 +1,151 @@
+//@version=5
+indicator("VWAP Directional Bias - Entry Signals - MNQ", overlay=true)
+// Entry-signal only: this script does NOT manage the trade.
+// Quantity, TP/SL, daily limits and flatten are handled by PickMyTrade.
+
+// ===== SIGNAL SETTINGS =====
+entryWindowStr    = input.session("0930-1550", "Signals Allowed (NY time)", group="Signal Settings")
+maxSignalsPerDay  = input.int(2, "Max Entry Signals Per Day (0 = unlimited)", minval=0, group="Signal Settings")
+signalMode        = input.string("VWAP cross", "Send signal on", options=["VWAP cross", "Every bar"], group="Signal Settings",
+     tooltip="VWAP cross: first bar of the window + every time price crosses VWAP. Every bar: every confirmed bar (PickMyTrade rejects it while a position is open).")
+
+// ===== PICKMYTRADE AUTOMATION SETTINGS =====
+pmtEnabled   = input.bool(true, "Enable PickMyTrade Alerts", group="PickMyTrade - General")
+pmtPlatform  = input.string("RITHMIC", "Platform", options=["RITHMIC", "TRADOVATE", "PROJECTX", "TRADESTATION", "TRADELOCKER"], group="PickMyTrade - General")
+pmtSymbolOverride = input.string("", "Symbol Override (blank = chart symbol) - MUST be the exact active contract, e.g. MNQZ2026", group="PickMyTrade - General")
+pmtQty       = input.int(1, "Quantity sent in signal", minval=1, group="PickMyTrade - General")
+
+// --- Account 1 ---
+acc1Enabled = input.bool(true, "Enable Account 1", group="PickMyTrade - Account 1")
+acc1Token   = input.string("", "Token", group="PickMyTrade - Account 1")
+acc1Id      = input.string("", "Account ID", group="PickMyTrade - Account 1")
+acc1Conn    = input.string("", "Connection Name", group="PickMyTrade - Account 1")
+acc1Qty     = input.float(1.0, "Quantity Multiplier", minval=0.0, step=0.1, group="PickMyTrade - Account 1")
+
+// --- Account 2 ---
+acc2Enabled = input.bool(false, "Enable Account 2", group="PickMyTrade - Account 2")
+acc2Token   = input.string("", "Token", group="PickMyTrade - Account 2")
+acc2Id      = input.string("", "Account ID", group="PickMyTrade - Account 2")
+acc2Conn    = input.string("", "Connection Name", group="PickMyTrade - Account 2")
+acc2Qty     = input.float(1.0, "Quantity Multiplier", minval=0.0, step=0.1, group="PickMyTrade - Account 2")
+
+// --- Account 3 ---
+acc3Enabled = input.bool(false, "Enable Account 3", group="PickMyTrade - Account 3")
+acc3Token   = input.string("", "Token", group="PickMyTrade - Account 3")
+acc3Id      = input.string("", "Account ID", group="PickMyTrade - Account 3")
+acc3Conn    = input.string("", "Connection Name", group="PickMyTrade - Account 3")
+acc3Qty     = input.float(1.0, "Quantity Multiplier", minval=0.0, step=0.1, group="PickMyTrade - Account 3")
+
+// --- Account 4 ---
+acc4Enabled = input.bool(false, "Enable Account 4", group="PickMyTrade - Account 4")
+acc4Token   = input.string("", "Token", group="PickMyTrade - Account 4")
+acc4Id      = input.string("", "Account ID", group="PickMyTrade - Account 4")
+acc4Conn    = input.string("", "Connection Name", group="PickMyTrade - Account 4")
+acc4Qty     = input.float(1.0, "Quantity Multiplier", minval=0.0, step=0.1, group="PickMyTrade - Account 4")
+
+// --- Account 5 ---
+acc5Enabled = input.bool(false, "Enable Account 5", group="PickMyTrade - Account 5")
+acc5Token   = input.string("", "Token", group="PickMyTrade - Account 5")
+acc5Id      = input.string("", "Account ID", group="PickMyTrade - Account 5")
+acc5Conn    = input.string("", "Connection Name", group="PickMyTrade - Account 5")
+acc5Qty     = input.float(1.0, "Quantity Multiplier", minval=0.0, step=0.1, group="PickMyTrade - Account 5")
+
+// ===== FIXED SETTINGS =====
+NY_TZ = "America/New_York"
+
+// ===== SESSION / NEW DAY =====
+inEntryWindow = not na(time(timeframe.period, entryWindowStr, NY_TZ))
+dateId = year(time, NY_TZ) * 10000 + month(time, NY_TZ) * 100 + dayofmonth(time, NY_TZ)
+var int prevDateId = na
+newDay = na(prevDateId) or dateId != prevDateId
+prevDateId := dateId
+
+// ===== VWAP (daily reset) =====
+[vwapValue, _u, _l] = ta.vwap(hlc3, newDay, 1)
+
+// ===== PICKMYTRADE - JSON BUILDER =====
+f_pmtSymbol() =>
+    pmtSymbolOverride == "" ? syminfo.ticker : pmtSymbolOverride
+
+f_primaryToken() =>
+    string tok = ""
+    if acc1Enabled
+        tok := acc1Token
+    else if acc2Enabled
+        tok := acc2Token
+    else if acc3Enabled
+        tok := acc3Token
+    else if acc4Enabled
+        tok := acc4Token
+    else if acc5Enabled
+        tok := acc5Token
+    tok
+
+f_accObj(tok, accId, conn, qtyMult) =>
+    '{"token":"' + tok + '","account_id":"' + accId + '","connection_name":"' + conn + '","risk_percentage":0,"quantity_multiplier":' + str.tostring(qtyMult) + '}'
+
+f_buildAccountsArray() =>
+    string result = ""
+    if acc1Enabled
+        result := result + f_accObj(acc1Token, acc1Id, acc1Conn, acc1Qty)
+    if acc2Enabled
+        result := (result == "" ? result : result + ",") + f_accObj(acc2Token, acc2Id, acc2Conn, acc2Qty)
+    if acc3Enabled
+        result := (result == "" ? result : result + ",") + f_accObj(acc3Token, acc3Id, acc3Conn, acc3Qty)
+    if acc4Enabled
+        result := (result == "" ? result : result + ",") + f_accObj(acc4Token, acc4Id, acc4Conn, acc4Qty)
+    if acc5Enabled
+        result := (result == "" ? result : result + ",") + f_accObj(acc5Token, acc5Id, acc5Conn, acc5Qty)
+    result
+
+// tp/sl = 0 -> PickMyTrade applies the TP/SL configured on its side.
+// duplicate_position_allow=false -> ignored while a position is already open.
+// reverse_order_close=false -> an opposite signal never closes/reverses the open trade.
+f_buildEntryJson(side) =>
+    '{"symbol":"' + f_pmtSymbol() + '","date":"{{timenow}}","data":"' + side +
+     '","quantity":' + str.tostring(pmtQty) +
+     ',"risk_percentage":0,"price":"' + str.tostring(close, format.mintick) + '","tp":0,"sl":0' +
+     ',"order_type":"MKT","update_tp":false,"update_sl":false,"token":"' + f_primaryToken() +
+     '","duplicate_position_allow":false,"platform":"' + pmtPlatform +
+     '","reverse_order_close":false,"account_id":"","multiple_accounts":[' + f_buildAccountsArray() + ']}'
+
+// ===== SIGNAL LOGIC =====
+var int signalsToday = 0
+var bool firstBarDone = false
+if newDay
+    signalsToday := 0
+    firstBarDone := false
+
+bias      = close > vwapValue ? 1 : close < vwapValue ? -1 : 0
+biasFlip  = bias != 0 and bias != nz(bias[1]) and not newDay
+trigger   = signalMode == "Every bar" ? bias != 0 : (not firstBarDone and bias != 0) or biasFlip
+underCap  = maxSignalsPerDay == 0 or signalsToday < maxSignalsPerDay
+sendNow   = inEntryWindow and barstate.isconfirmed and trigger and underCap
+
+longSig  = sendNow and bias == 1
+shortSig = sendNow and bias == -1
+
+if inEntryWindow and barstate.isconfirmed and bias != 0
+    firstBarDone := true
+
+if longSig or shortSig
+    signalsToday += 1
+    if pmtEnabled
+        alert(f_buildEntryJson(longSig ? "buy" : "sell"), alert.freq_once_per_bar_close)
+
+// ===== PLOTTING =====
+plot(vwapValue, title="VWAP", color=color.new(color.blue, 0), linewidth=2)
+plotshape(longSig,  title="Buy signal",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small)
+plotshape(shortSig, title="Sell signal", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small)
+
+// ===== DIAGNOSTIC TABLE =====
+var table diagTable = table.new(position.top_right, 2, 4, border_width=1)
+if barstate.islast
+    table.cell(diagTable, 0, 0, "VWAP")
+    table.cell(diagTable, 1, 0, str.tostring(vwapValue, format.mintick))
+    table.cell(diagTable, 0, 1, "Signals Today")
+    table.cell(diagTable, 1, 1, str.tostring(signalsToday))
+    table.cell(diagTable, 0, 2, "In Signal Window")
+    table.cell(diagTable, 1, 2, str.tostring(inEntryWindow))
+    table.cell(diagTable, 0, 3, "PMT Symbol Sent")
+    table.cell(diagTable, 1, 3, f_pmtSymbol(), bgcolor = pmtSymbolOverride == "" ? color.new(color.orange, 0) : na)

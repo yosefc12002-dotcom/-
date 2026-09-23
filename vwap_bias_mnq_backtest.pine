@@ -1,0 +1,212 @@
+//@version=5
+strategy("VWAP Bias Backtest v3 - MNQ", overlay=true, default_qty_type=strategy.fixed, default_qty_value=20, initial_capital=10000, currency=currency.USD, process_orders_on_close=true, use_bar_magnifier=true, commission_type=strategy.commission.cash_per_contract, commission_value=0.62, slippage=4)
+// Backtest-only copy of the entry-signal indicator.
+// Signals are generated exactly like the live indicator; the TP/SL bracket that
+// PickMyTrade places is simulated here so the Strategy Tester can show win rate.
+// Signals that arrive while a position is open are ignored (duplicate_position_allow=false)
+// but still count toward the daily cap, same as live.
+
+// ===== SIGNAL SETTINGS (keep identical to the live indicator) =====
+entryWindowStr    = input.session("0930-1550", "Signals Allowed (NY time)", group="Signal Settings")
+maxSignalsPerDay  = input.int(1, "Max Entry Signals Per Day (0 = unlimited)", minval=0, group="Signal Settings")
+signalMode        = input.string("VWAP cross", "Send signal on", options=["VWAP cross", "Every bar"], group="Signal Settings")
+
+// ===== PICKMYTRADE BRACKET (keep identical to PickMyTrade) =====
+qty         = input.int(20, "Contracts", minval=1, group="PickMyTrade Bracket")
+stopTicks   = input.int(20, "Stop Loss (ticks)", minval=1, group="PickMyTrade Bracket")
+targetTicks = input.int(80, "Take Profit (ticks)", minval=1, group="PickMyTrade Bracket")
+flattenOn   = input.bool(false, "Flatten at end of day", group="PickMyTrade Bracket")
+flattenStr  = input.session("1555-1600", "Flatten window (NY time)", group="PickMyTrade Bracket")
+simSlip     = input.int(4, "Slippage for stats table (ticks, keep = Properties > Slippage)", minval=0, group="Honest Stats Table")
+simComm     = input.float(0.62, "Commission per contract per side (USD)", minval=0, group="Honest Stats Table")
+ltfTf       = input.timeframe("1", "Intrabar timeframe used to resolve ambiguous bars", group="Honest Stats Table")
+
+NY_TZ = "America/New_York"
+
+// ===== SESSION / NEW DAY =====
+inEntryWindow = not na(time(timeframe.period, entryWindowStr, NY_TZ))
+dateId = year(time, NY_TZ) * 10000 + month(time, NY_TZ) * 100 + dayofmonth(time, NY_TZ)
+var int prevDateId = na
+newDay = na(prevDateId) or dateId != prevDateId
+prevDateId := dateId
+
+// ===== VWAP (daily reset) =====
+[vwapValue, _u, _l] = ta.vwap(hlc3, newDay, 1)
+
+// ===== SIGNAL LOGIC (same as live indicator) =====
+var int signalsToday = 0
+var bool firstBarDone = false
+if newDay
+    signalsToday := 0
+    firstBarDone := false
+
+bias      = close > vwapValue ? 1 : close < vwapValue ? -1 : 0
+biasFlip  = bias != 0 and bias != nz(bias[1]) and not newDay
+trigger   = signalMode == "Every bar" ? bias != 0 : (not firstBarDone and bias != 0) or biasFlip
+underCap  = maxSignalsPerDay == 0 or signalsToday < maxSignalsPerDay
+sendNow   = inEntryWindow and barstate.isconfirmed and trigger and underCap
+
+longSig  = sendNow and bias == 1
+shortSig = sendNow and bias == -1
+
+if inEntryWindow and barstate.isconfirmed and bias != 0
+    firstBarDone := true
+
+// ===== HONEST STATS (independent of Bar Magnifier) =====
+// Without Bar Magnifier TradingView GUESSES whether TP or SL was hit first when both
+// are inside the same bar. This table counts those "ambiguous" trades and shows the
+// result both ways: pessimistic (stop first) and optimistic (target first).
+// The real result is somewhere between the two.
+var int   simDir     = 0
+var float simEntry   = na
+var int   simTrades  = 0
+var int   simWinsP   = 0
+var int   simWinsO   = 0
+var int   simAmbig   = 0
+var float simNetP    = 0.0
+var float simNetO    = 0.0
+var float simEqP     = 0.0
+var float simPeakP   = 0.0
+var float simDDP     = 0.0
+var int   simWinsR   = 0
+var int   simUnres   = 0
+var float simNetR    = 0.0
+var float simEqR     = 0.0
+var float simPeakR   = 0.0
+var float simDDR     = 0.0
+
+// Lower-timeframe highs/lows inside the current chart bar, in time order.
+ltfH = request.security_lower_tf(syminfo.tickerid, ltfTf, high)
+ltfL = request.security_lower_tf(syminfo.tickerid, ltfTf, low)
+
+// Walks the intrabars in order: 1 = target hit first, -1 = stop hit first,
+// 0 = unknown (no intrabar data, or both hit inside the same intrabar).
+f_resolve(int dir, float sl, float tp) =>
+    int res = 0
+    int n = array.size(ltfH)
+    if n > 0
+        for i = 0 to n - 1
+            float h = array.get(ltfH, i)
+            float l = array.get(ltfL, i)
+            bool s = dir == 1 ? l <= sl : h >= sl
+            bool t = dir == 1 ? h >= tp : l <= tp
+            if s and t
+                break
+            if s
+                res := -1
+                break
+            if t
+                res := 1
+                break
+    res
+tickUsd = syminfo.mintick * syminfo.pointvalue
+costRT  = 2 * simComm * qty
+winUsd  = targetTicks * tickUsd * qty - costRT
+lossUsd = -(stopTicks + simSlip) * tickUsd * qty - costRT
+
+if simDir != 0
+    slPx  = simEntry - simDir * stopTicks * syminfo.mintick
+    tpPx  = simEntry + simDir * targetTicks * syminfo.mintick
+    hitSL = simDir == 1 ? low <= slPx : high >= slPx
+    hitTP = simDir == 1 ? high >= tpPx : low <= tpPx
+    float pP = na
+    float pO = na
+    float pR = na
+    if hitSL and hitTP
+        simAmbig += 1
+        pP := lossUsd
+        pO := winUsd
+        r = f_resolve(simDir, slPx, tpPx)
+        pR := r == 1 ? winUsd : lossUsd
+        simUnres += r == 0 ? 1 : 0
+    else if hitSL
+        pP := lossUsd
+        pO := lossUsd
+    else if hitTP
+        pP := winUsd
+        pO := winUsd
+    else if flattenOn and not na(time(timeframe.period, flattenStr, NY_TZ))
+        pP := (close - simEntry) * simDir * syminfo.pointvalue * qty - costRT
+        pO := pP
+    if not na(pP)
+        pR        := na(pR) ? pP : pR
+        simWinsR  += pR > 0 ? 1 : 0
+        simNetR   += pR
+        simEqR    += pR
+        simPeakR  := math.max(simPeakR, simEqR)
+        simDDR    := math.min(simDDR, simEqR - simPeakR)
+        simTrades += 1
+        simWinsP  += pP > 0 ? 1 : 0
+        simWinsO  += pO > 0 ? 1 : 0
+        simNetP   += pP
+        simNetO   += pO
+        simEqP    += pP
+        simPeakP  := math.max(simPeakP, simEqP)
+        simDDP    := math.min(simDDP, simEqP - simPeakP)
+        simDir    := 0
+
+if (longSig or shortSig) and simDir == 0
+    simDir   := longSig ? 1 : -1
+    simEntry := close + simDir * simSlip * syminfo.mintick
+
+// ===== SIMULATED PICKMYTRADE EXECUTION =====
+if longSig or shortSig
+    signalsToday += 1
+    if strategy.position_size == 0
+        if longSig
+            strategy.entry("Long", strategy.long, qty=qty)
+            strategy.exit("Long Bracket", from_entry="Long", loss=stopTicks, profit=targetTicks)
+        else
+            strategy.entry("Short", strategy.short, qty=qty)
+            strategy.exit("Short Bracket", from_entry="Short", loss=stopTicks, profit=targetTicks)
+
+if flattenOn and not na(time(timeframe.period, flattenStr, NY_TZ)) and strategy.position_size != 0
+    strategy.close_all(comment="EOD Flatten")
+
+// ===== PLOTTING =====
+plot(vwapValue, title="VWAP", color=color.new(color.blue, 0), linewidth=2, display=display.pane)
+plotshape(longSig,  title="Buy signal",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small, display=display.pane)
+plotshape(shortSig, title="Sell signal", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small, display=display.pane)
+
+// Stats shown next to the script name on the chart (status line), in this order:
+// Trades | Win% resolved | Net resolved | Max DD resolved | Ambiguous | Still unknown
+statsDisp = display.status_line + display.data_window
+plot(simTrades, "Trades", color=color.gray, display=statsDisp)
+plot(simTrades > 0 ? 100.0 * simWinsR / simTrades : na, "Win% (1m resolved)", color=color.orange, display=statsDisp)
+plot(simNetR, "Net USD (1m resolved)", color=color.green, display=statsDisp)
+plot(simDDR, "Max DD USD (1m resolved)", color=color.purple, display=statsDisp)
+plot(simAmbig, "Ambiguous trades", color=color.blue, display=statsDisp)
+plot(simUnres, "Still unknown after 1m", color=color.red, display=statsDisp)
+
+// ===== HONEST STATS TABLE =====
+// Resolved = ambiguous bars decided with 1-minute data; anything still unknown counts as a loss.
+var table st = table.new(position.bottom_left, 4, 8, border_width=1, bgcolor=color.new(color.white, 0), frame_color=color.gray, frame_width=1)
+f_netCell(col, row, v) =>
+    table.cell(st, col, row, str.tostring(v, "#"), bgcolor = v > 0 ? color.new(color.green, 70) : color.new(color.red, 70))
+if barstate.islast
+    table.cell(st, 0, 0, "", bgcolor=color.gray)
+    table.cell(st, 1, 0, "Pessimistic", bgcolor=color.gray, text_color=color.white)
+    table.cell(st, 2, 0, "Optimistic", bgcolor=color.gray, text_color=color.white)
+    table.cell(st, 3, 0, "1m resolved", bgcolor=color.navy, text_color=color.white)
+    table.cell(st, 0, 1, "Trades")
+    table.cell(st, 1, 1, str.tostring(simTrades))
+    table.cell(st, 2, 1, str.tostring(simTrades))
+    table.cell(st, 3, 1, str.tostring(simTrades))
+    table.cell(st, 0, 2, "Win rate %")
+    table.cell(st, 1, 2, simTrades > 0 ? str.tostring(100.0 * simWinsP / simTrades, "#.#") : "-")
+    table.cell(st, 2, 2, simTrades > 0 ? str.tostring(100.0 * simWinsO / simTrades, "#.#") : "-")
+    table.cell(st, 3, 2, simTrades > 0 ? str.tostring(100.0 * simWinsR / simTrades, "#.#") : "-")
+    table.cell(st, 0, 3, "Net USD")
+    f_netCell(1, 3, simNetP)
+    f_netCell(2, 3, simNetO)
+    f_netCell(3, 3, simNetR)
+    table.cell(st, 0, 4, "Max DD USD")
+    table.cell(st, 1, 4, str.tostring(simDDP, "#"))
+    table.cell(st, 2, 4, "")
+    table.cell(st, 3, 4, str.tostring(simDDR, "#"))
+    table.cell(st, 0, 5, "Ambiguous bars")
+    table.cell(st, 1, 5, str.tostring(simAmbig) + (simTrades > 0 ? " (" + str.tostring(100.0 * simAmbig / simTrades, "#") + "%)" : ""))
+    table.cell(st, 0, 6, "Still unknown after 1m")
+    table.cell(st, 3, 6, str.tostring(simUnres))
+    table.cell(st, 0, 7, "1m bars in last bar")
+    table.cell(st, 3, 7, str.tostring(array.size(ltfH)))
