@@ -1,5 +1,5 @@
 //@version=5
-strategy("VWAP Bias Backtest v2 - MNQ", overlay=true, default_qty_type=strategy.fixed, default_qty_value=20, initial_capital=10000, currency=currency.USD, process_orders_on_close=true, use_bar_magnifier=true, commission_type=strategy.commission.cash_per_contract, commission_value=0.62, slippage=4)
+strategy("VWAP Bias Backtest v3 - MNQ", overlay=true, default_qty_type=strategy.fixed, default_qty_value=20, initial_capital=10000, currency=currency.USD, process_orders_on_close=true, use_bar_magnifier=true, commission_type=strategy.commission.cash_per_contract, commission_value=0.62, slippage=4)
 // Backtest-only copy of the entry-signal indicator.
 // Signals are generated exactly like the live indicator; the TP/SL bracket that
 // PickMyTrade places is simulated here so the Strategy Tester can show win rate.
@@ -180,7 +180,7 @@ plot(simUnres, "Still unknown after 1m", color=color.red, display=statsDisp)
 
 // ===== HONEST STATS TABLE =====
 // Resolved = ambiguous bars decided with 1-minute data; anything still unknown counts as a loss.
-var table st = table.new(position.bottom_left, 4, 7, border_width=1, bgcolor=color.new(color.white, 0), frame_color=color.gray, frame_width=1)
+var table st = table.new(position.bottom_left, 4, 8, border_width=1, bgcolor=color.new(color.white, 0), frame_color=color.gray, frame_width=1)
 f_netCell(col, row, v) =>
     table.cell(st, col, row, str.tostring(v, "#"), bgcolor = v > 0 ? color.new(color.green, 70) : color.new(color.red, 70))
 if barstate.islast
@@ -208,3 +208,5 @@ if barstate.islast
     table.cell(st, 1, 5, str.tostring(simAmbig) + (simTrades > 0 ? " (" + str.tostring(100.0 * simAmbig / simTrades, "#") + "%)" : ""))
     table.cell(st, 0, 6, "Still unknown after 1m")
     table.cell(st, 3, 6, str.tostring(simUnres))
+    table.cell(st, 0, 7, "1m bars in last bar")
+    table.cell(st, 3, 7, str.tostring(array.size(ltfH)))
