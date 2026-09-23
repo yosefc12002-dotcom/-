@@ -1,0 +1,69 @@
+//@version=5
+strategy("VWAP Bias Signals - Backtest (PMT bracket sim) - MNQ", overlay=true, default_qty_type=strategy.fixed, default_qty_value=1, initial_capital=10000, currency=currency.USD, process_orders_on_close=true, use_bar_magnifier=true, commission_type=strategy.commission.cash_per_contract, commission_value=0.62, slippage=2)
+// Backtest-only copy of the entry-signal indicator.
+// Signals are generated exactly like the live indicator; the TP/SL bracket that
+// PickMyTrade places is simulated here so the Strategy Tester can show win rate.
+// Signals that arrive while a position is open are ignored (duplicate_position_allow=false)
+// but still count toward the daily cap, same as live.
+
+// ===== SIGNAL SETTINGS (keep identical to the live indicator) =====
+entryWindowStr    = input.session("0930-1550", "Signals Allowed (NY time)", group="Signal Settings")
+maxSignalsPerDay  = input.int(2, "Max Entry Signals Per Day (0 = unlimited)", minval=0, group="Signal Settings")
+signalMode        = input.string("VWAP cross", "Send signal on", options=["VWAP cross", "Every bar"], group="Signal Settings")
+
+// ===== PICKMYTRADE BRACKET (keep identical to PickMyTrade) =====
+qty         = input.int(1, "Contracts", minval=1, group="PickMyTrade Bracket")
+stopTicks   = input.int(8, "Stop Loss (ticks)", minval=1, group="PickMyTrade Bracket")
+targetTicks = input.int(50, "Take Profit (ticks)", minval=1, group="PickMyTrade Bracket")
+flattenOn   = input.bool(false, "Flatten at end of day", group="PickMyTrade Bracket")
+flattenStr  = input.session("1555-1600", "Flatten window (NY time)", group="PickMyTrade Bracket")
+
+NY_TZ = "America/New_York"
+
+// ===== SESSION / NEW DAY =====
+inEntryWindow = not na(time(timeframe.period, entryWindowStr, NY_TZ))
+dateId = year(time, NY_TZ) * 10000 + month(time, NY_TZ) * 100 + dayofmonth(time, NY_TZ)
+var int prevDateId = na
+newDay = na(prevDateId) or dateId != prevDateId
+prevDateId := dateId
+
+// ===== VWAP (daily reset) =====
+[vwapValue, _u, _l] = ta.vwap(hlc3, newDay, 1)
+
+// ===== SIGNAL LOGIC (same as live indicator) =====
+var int signalsToday = 0
+var bool firstBarDone = false
+if newDay
+    signalsToday := 0
+    firstBarDone := false
+
+bias      = close > vwapValue ? 1 : close < vwapValue ? -1 : 0
+biasFlip  = bias != 0 and bias != nz(bias[1]) and not newDay
+trigger   = signalMode == "Every bar" ? bias != 0 : (not firstBarDone and bias != 0) or biasFlip
+underCap  = maxSignalsPerDay == 0 or signalsToday < maxSignalsPerDay
+sendNow   = inEntryWindow and barstate.isconfirmed and trigger and underCap
+
+longSig  = sendNow and bias == 1
+shortSig = sendNow and bias == -1
+
+if inEntryWindow and barstate.isconfirmed and bias != 0
+    firstBarDone := true
+
+// ===== SIMULATED PICKMYTRADE EXECUTION =====
+if longSig or shortSig
+    signalsToday += 1
+    if strategy.position_size == 0
+        if longSig
+            strategy.entry("Long", strategy.long, qty=qty)
+            strategy.exit("Long Bracket", from_entry="Long", loss=stopTicks, profit=targetTicks)
+        else
+            strategy.entry("Short", strategy.short, qty=qty)
+            strategy.exit("Short Bracket", from_entry="Short", loss=stopTicks, profit=targetTicks)
+
+if flattenOn and not na(time(timeframe.period, flattenStr, NY_TZ)) and strategy.position_size != 0
+    strategy.close_all(comment="EOD Flatten")
+
+// ===== PLOTTING =====
+plot(vwapValue, title="VWAP", color=color.new(color.blue, 0), linewidth=2)
+plotshape(longSig,  title="Buy signal",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small)
+plotshape(shortSig, title="Sell signal", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small)
