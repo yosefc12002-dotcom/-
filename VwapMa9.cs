@@ -139,6 +139,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 				MALength            = 9;
 				CrossLookbackBars   = 3;
 				MaxTradesPerDay     = 1;
+				RequirePrevCloseAcrossVwap = false;
+				RequireRecentMaCross       = false;
 
 				// 3. Stop and Target
 				SwingLookbackBars   = 10;
@@ -320,15 +322,24 @@ namespace NinjaTrader.NinjaScript.Strategies
 			double vwap1 = vwapSeries[1];
 			double ma1   = ma[1];
 
-			bool shortSignal =
-				Close[0] < vwap0 &&
-				(ma0 < vwap0 || MaCrossedWithin(false)) &&
-				(Close[1] > vwap1 || Close[1] > ma1);
+			// MA condition: loose = MA beyond VWAP OR crossed recently; strict = MA beyond VWAP AND crossed within the lookback.
+			bool maShortOk = RequireRecentMaCross
+				? (ma0 < vwap0 && MaCrossedWithin(false))
+				: (ma0 < vwap0 || MaCrossedWithin(false));
+			bool maLongOk = RequireRecentMaCross
+				? (ma0 > vwap0 && MaCrossedWithin(true))
+				: (ma0 > vwap0 || MaCrossedWithin(true));
 
-			bool longSignal =
-				Close[0] > vwap0 &&
-				(ma0 > vwap0 || MaCrossedWithin(true)) &&
-				(Close[1] < vwap1 || Close[1] < ma1);
+			// Previous bar condition: loose = beyond VWAP OR beyond MA; strict = beyond VWAP (a true VWAP cross).
+			bool prevShortOk = RequirePrevCloseAcrossVwap
+				? Close[1] > vwap1
+				: (Close[1] > vwap1 || Close[1] > ma1);
+			bool prevLongOk = RequirePrevCloseAcrossVwap
+				? Close[1] < vwap1
+				: (Close[1] < vwap1 || Close[1] < ma1);
+
+			bool shortSignal = Close[0] < vwap0 && maShortOk && prevShortOk;
+			bool longSignal  = Close[0] > vwap0 && maLongOk && prevLongOk;
 
 			if (TradeDirection == VwapMa9Direction.Long)
 				shortSignal = false;
@@ -599,6 +610,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[Range(1, int.MaxValue)]
 		[Display(Name = "Max Trades Per Day", Order = 5, GroupName = "2. Setup")]
 		public int MaxTradesPerDay { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Require Prev Close Across VWAP", Description = "On: the previous bar must have closed on the other side of VWAP (true VWAP cross). Off: other side of VWAP or of the MA.", Order = 6, GroupName = "2. Setup")]
+		public bool RequirePrevCloseAcrossVwap { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Require Recent MA Cross", Description = "On: the MA must be beyond VWAP AND have crossed it within Cross Lookback Bars. Off: beyond VWAP OR crossed recently.", Order = 7, GroupName = "2. Setup")]
+		public bool RequireRecentMaCross { get; set; }
 
 		// ----- 3. Stop and Target -----
 
