@@ -68,6 +68,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private ISeries<double> ma;
 		private MAX swingHigh;
 		private MIN swingLow;
+		private EMA trendEma;
 
 		// Manual VWAP state
 		private Series<double> vwapSeries;
@@ -94,6 +95,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private double pendStop;
 		private double pendTarget;
 		private int pendQty;
+		private double entryFillPrice;
+		private double initialRiskPoints;
+		private bool breakevenMoved;
 
 		// Visual state for stop/target lines
 		private bool lineActive;
@@ -141,12 +145,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 				MaxTradesPerDay     = 1;
 				RequirePrevCloseAcrossVwap = false;
 				RequireRecentMaCross       = false;
+				TrendEmaLength             = 0;
 
 				// 3. Stop and Target
 				SwingLookbackBars   = 10;
 				StopBufferTicks     = 2;
 				MaxStopPoints       = 0;
 				RiskReward          = 2;
+				BreakevenAtR        = 0;
 
 				// 4. Session (NY time)
 				SessionStartHour    = 9;
@@ -155,6 +161,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 				LastEntryMinute     = 0;
 				ExitHour            = 15;
 				ExitMinute          = 50;
+				UseSecondWindow     = false;
+				SecondStartHour     = 13;
+				SecondStartMinute   = 30;
+				SecondEndHour       = 15;
+				SecondEndMinute     = 0;
 
 				// 5. Risk Limits
 				MaxDailyLoss        = 0;
@@ -175,6 +186,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 					ma = SMA(Close, MALength);
 				else
 					ma = EMA(Close, MALength);
+
+				if (TrendEmaLength > 0)
+					trendEma = EMA(Close, TrendEmaLength);
 
 				swingHigh       = MAX(High, SwingLookbackBars);
 				swingLow        = MIN(Low, SwingLookbackBars);
@@ -297,6 +311,32 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return;
 			}
 
+			// ---------- Breakeven: move the stop to entry once price has moved X R in favor ----------
+			if (BreakevenAtR > 0 && !breakevenMoved && initialRiskPoints > 0 && Position.MarketPosition != MarketPosition.Flat)
+			{
+				double tickSz = TickSize > 0 ? TickSize : 0.25;
+				if (Position.MarketPosition == MarketPosition.Long && High[0] >= entryFillPrice + BreakevenAtR * initialRiskPoints)
+				{
+					double beStop = Instrument.MasterInstrument.RoundToTickSize(entryFillPrice + tickSz);
+					if (Close[0] > beStop)   // Only move if the new stop is below the current price
+					{
+						SetStopLoss(LongSignal, CalculationMode.Price, beStop, false);
+						breakevenMoved = true;
+					}
+				}
+				else if (Position.MarketPosition == MarketPosition.Short && Low[0] <= entryFillPrice - BreakevenAtR * initialRiskPoints)
+				{
+					double beStop = Instrument.MasterInstrument.RoundToTickSize(entryFillPrice - tickSz);
+					if (Close[0] < beStop)   // Only move if the new stop is above the current price
+					{
+						SetStopLoss(ShortSignal, CalculationMode.Price, beStop, false);
+						breakevenMoved = true;
+					}
+				}
+				if (breakevenMoved && ShowVisuals && lineActive)
+					lineStop = Instrument.MasterInstrument.RoundToTickSize(Position.MarketPosition == MarketPosition.Long ? entryFillPrice + tickSz : entryFillPrice - tickSz);
+			}
+
 			// ---------- Time exit ----------
 			if (Position.MarketPosition != MarketPosition.Flat && nyTod >= exitTime)
 			{
@@ -313,7 +353,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return;
 			if (!vwapValid || sessionBars < 2)   // Need the previous bar inside today's session
 				return;
-			if (nyTod > lastEntry || nyTod >= exitTime)
+			// Entry windows: main window (session start .. last entry) and an optional second window.
+			bool inMainWindow   = nyTod > sessionStart && nyTod <= lastEntry;
+			bool inSecondWindow = UseSecondWindow
+				&& nyTod >= new TimeSpan(SecondStartHour, SecondStartMinute, 0)
+				&& nyTod <= new TimeSpan(SecondEndHour, SecondEndMinute, 0);
+			if (!(inMainWindow || inSecondWindow) || nyTod >= exitTime)
 				return;
 			// Fresh cross after a closed trade: the "previous bar" of the signal must come after the exit bar.
 			if (lastExitBar >= 0 && CurrentBar - 1 <= lastExitBar)
@@ -340,6 +385,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 			bool shortSignal = Close[0] < vwap0 && maShortOk && prevShortOk;
 			bool longSignal  = Close[0] > vwap0 && maLongOk && prevLongOk;
+
+			// Optional trend filter: trade only in the direction of a slower EMA.
+			if (trendEma != null)
+			{
+				if (Close[0] <= trendEma[0]) longSignal  = false;
+				if (Close[0] >= trendEma[0]) shortSignal = false;
+			}
 
 			if (TradeDirection == VwapMa9Direction.Long)
 				shortSignal = false;
@@ -501,8 +553,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 			if (orderState == OrderState.Filled)
 			{
-				pendingEntry = false;
+				pendingEntry      = false;
 				tradesToday++;
+				entryFillPrice    = averageFillPrice;
+				initialRiskPoints = Math.Abs(averageFillPrice - pendStop);
+				breakevenMoved    = false;
 
 				Print(string.Format("VwapMa9 | {0:yyyy-MM-dd HH:mm} NY | {1} | entry {2} | stop {3} | target {4} | contracts {5}",
 					ToNewYork(time),
@@ -619,6 +674,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[Display(Name = "Require Recent MA Cross", Description = "On: the MA must be beyond VWAP AND have crossed it within Cross Lookback Bars. Off: beyond VWAP OR crossed recently.", Order = 7, GroupName = "2. Setup")]
 		public bool RequireRecentMaCross { get; set; }
 
+		[NinjaScriptProperty]
+		[Range(0, int.MaxValue)]
+		[Display(Name = "Trend EMA Length", Description = "0 = off. Longs only above this EMA, shorts only below it.", Order = 8, GroupName = "2. Setup")]
+		public int TrendEmaLength { get; set; }
+
 		// ----- 3. Stop and Target -----
 
 		[NinjaScriptProperty]
@@ -640,6 +700,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[Range(0.1, double.MaxValue)]
 		[Display(Name = "Risk:Reward", Order = 4, GroupName = "3. Stop and Target")]
 		public double RiskReward { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, double.MaxValue)]
+		[Display(Name = "Breakeven At R", Description = "0 = off. Move the stop to entry +1 tick once price reaches this multiple of the initial risk.", Order = 5, GroupName = "3. Stop and Target")]
+		public double BreakevenAtR { get; set; }
 
 		// ----- 4. Session (NY time) -----
 
@@ -672,6 +737,30 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[Range(0, 59)]
 		[Display(Name = "Exit Minute", Order = 6, GroupName = "4. Session (NY time)")]
 		public int ExitMinute { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Use Second Entry Window", Order = 7, GroupName = "4. Session (NY time)")]
+		public bool UseSecondWindow { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 23)]
+		[Display(Name = "Second Window Start Hour", Order = 8, GroupName = "4. Session (NY time)")]
+		public int SecondStartHour { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 59)]
+		[Display(Name = "Second Window Start Minute", Order = 9, GroupName = "4. Session (NY time)")]
+		public int SecondStartMinute { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 23)]
+		[Display(Name = "Second Window End Hour", Order = 10, GroupName = "4. Session (NY time)")]
+		public int SecondEndHour { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 59)]
+		[Display(Name = "Second Window End Minute", Order = 11, GroupName = "4. Session (NY time)")]
+		public int SecondEndMinute { get; set; }
 
 		// ----- 5. Risk Limits -----
 
