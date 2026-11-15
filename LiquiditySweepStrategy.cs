@@ -90,10 +90,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MaxTradesPerDay   = 0;
                 DrawLevels        = true;
             }
-            else if (State == State.Configure)
+            else if (State == State.DataLoaded)
             {
-                int tpTicks = Math.Max(1, (int)Math.Round(TakeProfitPoints / Instrument.MasterInstrument.TickSize));
-                int slTicks = Math.Max(1, (int)Math.Round(StopLossPoints  / Instrument.MasterInstrument.TickSize));
+                // TickSize is only guaranteed once data is loaded (Instrument can be null in Configure)
+                int tpTicks = Math.Max(1, (int)Math.Round(TakeProfitPoints / TickSize));
+                int slTicks = Math.Max(1, (int)Math.Round(StopLossPoints  / TickSize));
 
                 SetProfitTarget("SweepLong",  CalculationMode.Ticks, tpTicks);
                 SetStopLoss    ("SweepLong",  CalculationMode.Ticks, slTicks, false);
