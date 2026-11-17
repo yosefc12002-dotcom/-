@@ -146,8 +146,8 @@ if dir != 0 and not fvgFound and not dayDead
             c2    := math.max(high[1], fFar)
         if not na(fNear)
             sizeOk    = math.abs(fNear - fFar) >= minFvgTicks * syminfo.mintick
-            line      = dir == 1 ? rHi : rLo
-            overlapOk = not needOverlap or (line >= math.min(fNear, fFar) and line <= math.max(fNear, fFar))
+            lvlLine   = dir == 1 ? rHi : rLo
+            overlapOk = not needOverlap or (lvlLine >= math.min(fNear, fFar) and lvlLine <= math.max(fNear, fFar))
             if sizeOk and overlapOk
                 fvgFound := true
                 newFvg   := true
