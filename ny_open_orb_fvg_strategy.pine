@@ -1,0 +1,127 @@
+//@version=6
+// NY Open 15m Range -> 5m breakout close -> FVG on the range line -> entry at FVG 50%
+// Stop beyond the displacement candle (candle 2), target 1:2. Use on a 5-minute chart.
+strategy("NY Open ORB + FVG", overlay = true, initial_capital = 10000,
+     default_qty_type = strategy.fixed, default_qty_value = 1, max_boxes_count = 500)
+
+// ---------- Inputs ----------
+grpS = "Session (New York time)"
+tz        = input.string("America/New_York", "Timezone", group = grpS)
+rangeSess = input.session("0930-0945", "Opening range = first 15m candle", group = grpS)
+tradeSess = input.session("0945-1200", "Window for breakout & entry", group = grpS)
+flatSess  = input.session("1555-1600", "Close everything at", group = grpS)
+
+grpB = "Setup"
+allowLong   = input.bool(true, "Longs", group = grpB)
+allowShort  = input.bool(true, "Shorts", group = grpB)
+needOverlap = input.bool(true, "FVG must sit on the range line", group = grpB)
+minFvgTicks = input.int(0, "Minimum FVG size (ticks)", minval = 0, group = grpB)
+entryMode   = input.string("FVG 50%", "Entry", options = ["FVG 50%", "FVG edge"], group = grpB)
+stopMode    = input.string("Candle 2", "Stop beyond", options = ["Candle 2", "FVG"], group = grpB)
+bufTicks    = input.int(2, "Stop buffer (ticks)", minval = 0, group = grpB)
+rr          = input.float(2.0, "R:R target", minval = 0.5, step = 0.25, group = grpB)
+
+// ---------- Time helpers ----------
+inRange = not na(time(timeframe.period, rangeSess, tz))
+inTrade = not na(time(timeframe.period, tradeSess, tz))
+inFlat  = not na(time(timeframe.period, flatSess, tz))
+newDay  = dayofmonth(time, tz) != dayofmonth(time[1], tz)
+
+// ---------- State ----------
+var float rHi      = na
+var float rLo      = na
+var int   dir      = 0
+var int   brkBar   = na
+var bool  fvgFound = false
+var bool  dayDone  = false
+var float entryPx  = na
+var float stopPx   = na
+var float tpPx     = na
+
+if newDay
+    rHi      := na
+    rLo      := na
+    dir      := 0
+    brkBar   := na
+    fvgFound := false
+    dayDone  := false
+    entryPx  := na
+    stopPx   := na
+    tpPx     := na
+    strategy.cancel_all()
+
+// 1) Opening range
+if inRange
+    rHi := na(rHi) ? high : math.max(rHi, high)
+    rLo := na(rLo) ? low  : math.min(rLo, low)
+rangeDone = not na(rHi) and not inRange
+
+// Position opened -> no more setups today
+if strategy.position_size != 0
+    dayDone := true
+
+// 2) Breakout close
+breakoutBar = false
+if rangeDone and inTrade and dir == 0 and not dayDone
+    if close > rHi and allowLong
+        dir := 1
+    else if close < rLo and allowShort
+        dir := -1
+    if dir != 0
+        brkBar      := bar_index
+        breakoutBar := true
+        alert((dir == 1 ? "Bullish" : "Bearish") + " breakout of NY 15m range on " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+// 3) First valid FVG after the breakout -> place limit order
+if dir != 0 and not fvgFound and not dayDone and inTrade and bar_index >= brkBar + 1
+    float fNear = na
+    float fFar  = na
+    float c2    = na
+    if dir == 1 and low > high[2]
+        fNear := low
+        fFar  := high[2]
+        c2    := math.min(low[1], fFar)
+    else if dir == -1 and high < low[2]
+        fNear := high
+        fFar  := low[2]
+        c2    := math.max(high[1], fFar)
+    if not na(fNear)
+        lvlLine   = dir == 1 ? rHi : rLo
+        sizeOk    = math.abs(fNear - fFar) >= minFvgTicks * syminfo.mintick
+        overlapOk = not needOverlap or (lvlLine >= math.min(fNear, fFar) and lvlLine <= math.max(fNear, fFar))
+        if sizeOk and overlapOk
+            fvgFound := true
+            entryPx  := entryMode == "FVG 50%" ? (fNear + fFar) / 2 : fNear
+            stopPx   := (stopMode == "Candle 2" ? c2 : fFar) - dir * bufTicks * syminfo.mintick
+            tpPx     := entryPx + dir * math.abs(entryPx - stopPx) * rr
+            box.new(bar_index - 2, math.max(fNear, fFar), bar_index + 12, math.min(fNear, fFar),
+                 border_color = dir == 1 ? color.green : color.red,
+                 bgcolor = color.new(dir == 1 ? color.green : color.red, 80), text = "FVG", text_color = color.white, text_size = size.small)
+            if dir == 1
+                strategy.entry("Long", strategy.long, limit = entryPx)
+                strategy.exit("Long X", "Long", stop = stopPx, limit = tpPx)
+            else
+                strategy.entry("Short", strategy.short, limit = entryPx)
+                strategy.exit("Short X", "Short", stop = stopPx, limit = tpPx)
+            alert("FVG ready on " + syminfo.ticker + ": limit " + str.tostring(entryPx) + " | SL " + str.tostring(stopPx) + " | TP " + str.tostring(tpPx), alert.freq_once_per_bar_close)
+
+// 4) Entry window over without a fill -> cancel
+if not inTrade and strategy.position_size == 0 and fvgFound and not dayDone
+    strategy.cancel_all()
+    dayDone := true
+
+// 5) End of day
+if inFlat
+    strategy.cancel_all()
+    strategy.close_all(comment = "EOD")
+
+// ---------- Visuals ----------
+bgcolor(inRange ? color.new(color.blue, 85) : na, title = "Opening range bg")
+plot(rangeDone ? rHi : na, "Range high", color.green, 2, plot.style_linebr)
+plot(rangeDone ? rLo : na, "Range low",  color.red,   2, plot.style_linebr)
+showLv = fvgFound and not (dayDone and strategy.position_size == 0)
+plot(showLv ? entryPx : na, "Entry",  color.aqua, 2, plot.style_linebr)
+plot(showLv ? stopPx  : na, "Stop",   color.red,  1, plot.style_linebr)
+plot(showLv ? tpPx    : na, "Target", color.lime, 1, plot.style_linebr)
+plotshape(breakoutBar and dir == 1,  "Bull breakout", shape.triangleup,   location.belowbar, color.green, size = size.small)
+plotshape(breakoutBar and dir == -1, "Bear breakout", shape.triangledown, location.abovebar, color.red,   size = size.small)
