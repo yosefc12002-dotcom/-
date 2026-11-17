@@ -1,0 +1,143 @@
+//@version=6
+// NY Open 15m Range -> 5m Breakout -> Fibonacci Retracement Entry
+// 1. Mark the first 15-minute candle of the New York open (09:30-09:45 NY time).
+// 2. On the 5-minute chart, wait for a breakout of that candle's high or low.
+// 3. Draw Fibonacci from the start of the move to the breakout extreme.
+// 4. Enter on the retracement to the chosen Fibonacci level (limit order).
+// Use on a 5-minute chart (works on 1m/3m too).
+strategy("NY Open 15m Breakout + Fib Retrace", overlay = true, initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
+     commission_type = strategy.commission.percent, commission_value = 0.0)
+
+// ---------- Inputs ----------
+grpS = "Session (New York time)"
+tz        = input.string("America/New_York", "Timezone", group = grpS)
+rangeSess = input.session("0930-0945", "Opening range = first 15m candle", group = grpS)
+tradeSess = input.session("0945-1200", "Window for breakout & entry", group = grpS)
+flatSess  = input.session("1555-1600", "Close everything at", group = grpS)
+
+grpB = "Breakout"
+breakMode  = input.string("Close", "Breakout confirmation", options = ["Close", "Wick"], group = grpB,
+     tooltip = "Close = a 5m candle must close beyond the range. Wick = any touch beyond the range.")
+anchorMode = input.string("Opposite side of range", "Fib anchor (level 1.0)",
+     options = ["Opposite side of range", "Breakout candle"], group = grpB,
+     tooltip = "Where the Fibonacci starts. Long: range low or the breakout candle's low. Short: range high or the breakout candle's high.")
+allowLong  = input.bool(true, "Allow longs", group = grpB)
+allowShort = input.bool(true, "Allow shorts", group = grpB)
+
+grpF = "Fibonacci / Risk"
+entryFib = input.float(0.618, "Entry level", options = [0.382, 0.5, 0.618, 0.705, 0.786], group = grpF)
+stopFib  = input.float(1.0, "Stop level (fib)", minval = 0.5, maxval = 1.5, step = 0.01, group = grpF)
+bufTicks = input.int(2, "Stop buffer (ticks)", minval = 0, group = grpF)
+tpMode   = input.string("Risk:Reward", "Take profit", options = ["Risk:Reward", "Fib extension", "Swing extreme (fib 0)"], group = grpF)
+rr       = input.float(2.0, "R:R (if Risk:Reward)", minval = 0.5, step = 0.25, group = grpF)
+extLvl   = input.float(0.272, "Extension beyond extreme (if Fib extension)", minval = 0.0, step = 0.01, group = grpF)
+
+if stopFib <= entryFib
+    runtime.error("Stop level must be greater than the entry level")
+
+// ---------- Time helpers ----------
+inRange = not na(time(timeframe.period, rangeSess, tz))
+inTrade = not na(time(timeframe.period, tradeSess, tz))
+inFlat  = not na(time(timeframe.period, flatSess, tz))
+newDay  = dayofmonth(time, tz) != dayofmonth(time[1], tz)
+
+// ---------- State ----------
+var float rHi         = na
+var float rLo         = na
+var int   dir         = 0     // 1 = long setup, -1 = short setup
+var float fStart      = na    // fib 1.0 (start of the move)
+var float fExt        = na    // fib 0.0 (extreme of the move)
+var bool  tradedToday = false
+var bool  setupDead   = false
+
+if newDay
+    rHi         := na
+    rLo         := na
+    dir         := 0
+    fStart      := na
+    fExt        := na
+    tradedToday := false
+    setupDead   := false
+    strategy.cancel_all()
+
+// 1) Build the 15m opening range from the lower-timeframe bars
+if inRange
+    rHi := na(rHi) ? high : math.max(rHi, high)
+    rLo := na(rLo) ? low  : math.min(rLo, low)
+rangeDone = not na(rHi) and not inRange
+
+// Fib price: level 0 = extreme, level 1 = start; negative = extension
+fib(float lvl) => fExt + (fStart - fExt) * lvl
+
+// 2) Detect the breakout
+upBreak = breakMode == "Close" ? close > rHi : high > rHi
+dnBreak = breakMode == "Close" ? close < rLo : low < rLo
+breakoutBar = false
+if rangeDone and inTrade and dir == 0 and not tradedToday and not setupDead
+    if upBreak and allowLong
+        dir         := 1
+        fStart      := anchorMode == "Opposite side of range" ? rLo : low
+        fExt        := high
+        breakoutBar := true
+    else if dnBreak and allowShort
+        dir         := -1
+        fStart      := anchorMode == "Opposite side of range" ? rHi : high
+        fExt        := low
+        breakoutBar := true
+    if breakoutBar
+        alert((dir == 1 ? "Bullish" : "Bearish") + " breakout of NY 15m opening range on " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+// Position opened -> freeze the setup
+if strategy.position_size != 0 and dir != 0
+    tradedToday := true
+
+// 3) Manage the setup: follow the extreme, invalidate, place limit order at the fib level
+if dir != 0 and not tradedToday and not setupDead and strategy.position_size == 0
+    // extend the impulse while price keeps running (the fib is redrawn)
+    if not breakoutBar
+        fExt := dir == 1 ? math.max(fExt, high) : math.min(fExt, low)
+
+    invalid = dir == 1 ? close < fStart : close > fStart
+    if invalid or not inTrade
+        setupDead := true
+        strategy.cancel_all()
+    else
+        buf     = bufTicks * syminfo.mintick
+        entryPx = fib(entryFib)
+        slPx    = fib(stopFib) - dir * buf
+        risk    = math.abs(entryPx - slPx)
+        tpPx    = tpMode == "Risk:Reward" ? entryPx + dir * risk * rr :
+                  tpMode == "Fib extension" ? fib(-extLvl) : fExt
+        // only rest the limit order while price is still away from the entry level
+        priceAway = dir == 1 ? close > entryPx : close < entryPx
+        if priceAway
+            if dir == 1
+                strategy.entry("Long", strategy.long, limit = entryPx)
+                strategy.exit("Long X", "Long", stop = slPx, limit = tpPx)
+            else
+                strategy.entry("Short", strategy.short, limit = entryPx)
+                strategy.exit("Short X", "Short", stop = slPx, limit = tpPx)
+        else
+            strategy.cancel_all()
+
+// End of day: flat
+if inFlat
+    strategy.cancel_all()
+    strategy.close_all(comment = "EOD")
+
+// ---------- Visuals ----------
+bgcolor(inRange ? color.new(color.blue, 85) : na, title = "Opening range bg")
+plot(rangeDone ? rHi : na, "Range high", color.new(color.green, 0), 2, plot.style_linebr)
+plot(rangeDone ? rLo : na, "Range low",  color.new(color.red, 0),   2, plot.style_linebr)
+
+showFib = dir != 0
+plot(showFib ? fib(0.0)      : na, "Fib 0",     color.gray,                 1, plot.style_linebr)
+plot(showFib ? fib(0.5)      : na, "Fib 0.5",   color.new(color.orange, 0), 1, plot.style_linebr)
+plot(showFib ? fib(0.618)    : na, "Fib 0.618", color.new(color.yellow, 0), 2, plot.style_linebr)
+plot(showFib ? fib(0.786)    : na, "Fib 0.786", color.new(color.purple, 0), 1, plot.style_linebr)
+plot(showFib ? fib(1.0)      : na, "Fib 1",     color.gray,                 1, plot.style_linebr)
+plot(showFib ? fib(entryFib) : na, "Entry",     color.new(color.aqua, 0),   2, plot.style_circles)
+
+plotshape(breakoutBar and dir == 1,  "Bull breakout", shape.triangleup,   location.belowbar, color.green, size = size.small)
+plotshape(breakoutBar and dir == -1, "Bear breakout", shape.triangledown, location.abovebar, color.red,   size = size.small)
