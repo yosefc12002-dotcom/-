@@ -1,0 +1,215 @@
+//@version=6
+// NY Open 15m Breakout - Fibonacci level comparison
+// Runs the same setup as "NY Open 15m Breakout + Fib Retrace" on 4 entry levels at once
+// (default 50% / 60% / 65% / 70%) and shows a statistics table:
+// how many times each level was reached (fills), wins, losses, win rate and total R.
+// Use on a 5-minute chart. More history = more reliable numbers.
+indicator("NY Open Fib Level Tester", overlay = true)
+
+// ---------- Inputs ----------
+grpS = "Session (New York time)"
+tz        = input.string("America/New_York", "Timezone", group = grpS)
+rangeSess = input.session("0930-0945", "Opening range = first 15m candle", group = grpS)
+tradeSess = input.session("0945-1200", "Window for breakout & entry", group = grpS)
+flatSess  = input.session("1555-1600", "Close everything at", group = grpS)
+
+grpB = "Breakout"
+breakMode  = input.string("Close", "Breakout confirmation", options = ["Close", "Wick"], group = grpB)
+anchorMode = input.string("Opposite side of range", "Fib anchor (level 1.0)",
+     options = ["Opposite side of range", "Breakout candle"], group = grpB)
+allowLong  = input.bool(true, "Test longs", group = grpB)
+allowShort = input.bool(true, "Test shorts", group = grpB)
+
+grpL = "Levels to compare"
+lvl1 = input.float(0.50, "Level 1", step = 0.01, group = grpL)
+lvl2 = input.float(0.60, "Level 2", step = 0.01, group = grpL)
+lvl3 = input.float(0.65, "Level 3", step = 0.01, group = grpL)
+lvl4 = input.float(0.70, "Level 4", step = 0.01, group = grpL)
+
+grpR = "Risk"
+stopFib  = input.float(1.0, "Stop level (fib)", minval = 0.5, maxval = 1.5, step = 0.01, group = grpR)
+bufTicks = input.int(2, "Stop buffer (ticks)", minval = 0, group = grpR)
+tpMode   = input.string("Risk:Reward", "Take profit", options = ["Risk:Reward", "Swing extreme (fib 0)"], group = grpR)
+rr       = input.float(2.0, "R:R (if Risk:Reward)", minval = 0.5, step = 0.25, group = grpR)
+tblPos   = input.string("Top right", "Table position", options = ["Top right", "Bottom right", "Top left", "Bottom left"], group = grpR)
+
+if math.max(lvl1, lvl2, lvl3, lvl4) >= stopFib
+    runtime.error("All levels must be below the stop level")
+
+N = 4
+levels = array.from(lvl1, lvl2, lvl3, lvl4)
+
+// ---------- Time helpers ----------
+inRange = not na(time(timeframe.period, rangeSess, tz))
+inTrade = not na(time(timeframe.period, tradeSess, tz))
+inFlat  = not na(time(timeframe.period, flatSess, tz))
+newDay  = dayofmonth(time, tz) != dayofmonth(time[1], tz)
+
+// ---------- Day state ----------
+var float rHi    = na
+var float rLo    = na
+var int   dir    = 0
+var float fStart = na
+var float fExt   = na
+var bool  dayDead = false
+
+// per level: 0 = waiting, 1 = limit armed, 2 = in trade, 3 = done for the day
+var array<int>   st   = array.new<int>(N, 0)
+var array<float> pend = array.new<float>(N, na)
+var array<float> ent  = array.new<float>(N, na)
+var array<float> sl   = array.new<float>(N, na)
+var array<float> tp   = array.new<float>(N, na)
+
+// ---------- Statistics ----------
+var int          setups = 0
+var array<int>   fills  = array.new<int>(N, 0)
+var array<int>   wins   = array.new<int>(N, 0)
+var array<int>   losses = array.new<int>(N, 0)
+var array<int>   eods   = array.new<int>(N, 0)
+var array<float> sumR   = array.new<float>(N, 0.0)
+
+fib(float lvl) => fExt + (fStart - fExt) * lvl
+
+closeTrade(int i, float r) =>
+    sumR.set(i, sumR.get(i) + r)
+    if r > 0
+        wins.set(i, wins.get(i) + 1)
+    else
+        losses.set(i, losses.get(i) + 1)
+    st.set(i, 3)
+
+if newDay
+    rHi     := na
+    rLo     := na
+    dir     := 0
+    fStart  := na
+    fExt    := na
+    dayDead := false
+    for i = 0 to N - 1
+        st.set(i, 0)
+        pend.set(i, na)
+
+// 1) Opening range
+if inRange
+    rHi := na(rHi) ? high : math.max(rHi, high)
+    rLo := na(rLo) ? low  : math.min(rLo, low)
+rangeDone = not na(rHi) and not inRange
+
+// 2) Process orders placed on the previous bar (fills, stops, targets)
+if dir != 0
+    for i = 0 to N - 1
+        s = st.get(i)
+        if s == 1
+            e = pend.get(i)
+            if dir == 1 ? low <= e : high >= e
+                stopPx = fib(stopFib) - dir * bufTicks * syminfo.mintick
+                risk   = math.abs(e - stopPx)
+                tgt    = tpMode == "Risk:Reward" ? e + dir * risk * rr : fExt
+                ent.set(i, e)
+                sl.set(i, stopPx)
+                tp.set(i, tgt)
+                st.set(i, 2)
+                fills.set(i, fills.get(i) + 1)
+                // conservative: stop touched on the fill bar = loss
+                if dir == 1 ? low <= stopPx : high >= stopPx
+                    closeTrade(i, -1.0)
+        else if s == 2
+            e      = ent.get(i)
+            risk   = math.abs(e - sl.get(i))
+            stopHit = dir == 1 ? low <= sl.get(i) : high >= sl.get(i)
+            tpHit   = dir == 1 ? high >= tp.get(i) : low <= tp.get(i)
+            if stopHit                       // stop first if both in the same bar (conservative)
+                closeTrade(i, -1.0)
+            else if tpHit
+                closeTrade(i, math.abs(tp.get(i) - e) / risk)
+            else if inFlat
+                eods.set(i, eods.get(i) + 1)
+                closeTrade(i, dir * (close - e) / risk)
+
+// 3) Breakout
+upBreak = breakMode == "Close" ? close > rHi : high > rHi
+dnBreak = breakMode == "Close" ? close < rLo : low < rLo
+breakoutBar = false
+if rangeDone and inTrade and dir == 0 and not dayDead
+    if upBreak and allowLong
+        dir         := 1
+        fStart      := anchorMode == "Opposite side of range" ? rLo : low
+        fExt        := high
+        breakoutBar := true
+    else if dnBreak and allowShort
+        dir         := -1
+        fStart      := anchorMode == "Opposite side of range" ? rHi : high
+        fExt        := low
+        breakoutBar := true
+    if breakoutBar
+        setups += 1
+
+// 4) Update the fib and arm the limit orders for the next bar
+if dir != 0 and not dayDead
+    if not breakoutBar
+        fExt := dir == 1 ? math.max(fExt, high) : math.min(fExt, low)
+    invalid = (dir == 1 ? close < fStart : close > fStart) or not inTrade
+    for i = 0 to N - 1
+        s = st.get(i)
+        if s == 0 or s == 1
+            if invalid
+                st.set(i, 3)
+            else
+                e = fib(levels.get(i))
+                if dir == 1 ? close > e : close < e
+                    st.set(i, 1)
+                    pend.set(i, e)
+                else
+                    st.set(i, 0)
+    if invalid
+        dayDead := true
+
+// ---------- Visuals ----------
+bgcolor(inRange ? color.new(color.blue, 85) : na, title = "Opening range bg")
+plot(rangeDone ? rHi : na, "Range high", color.green, 2, plot.style_linebr)
+plot(rangeDone ? rLo : na, "Range low",  color.red,   2, plot.style_linebr)
+showFib = dir != 0
+plot(showFib ? fib(lvl1) : na, "Level 1", color.new(color.orange, 0), 1, plot.style_linebr)
+plot(showFib ? fib(lvl2) : na, "Level 2", color.new(color.yellow, 0), 1, plot.style_linebr)
+plot(showFib ? fib(lvl3) : na, "Level 3", color.new(color.aqua, 0),   1, plot.style_linebr)
+plot(showFib ? fib(lvl4) : na, "Level 4", color.new(color.purple, 0), 1, plot.style_linebr)
+plotshape(breakoutBar and dir == 1,  "Bull breakout", shape.triangleup,   location.belowbar, color.green, size = size.small)
+plotshape(breakoutBar and dir == -1, "Bear breakout", shape.triangledown, location.abovebar, color.red,   size = size.small)
+
+// ---------- Results table ----------
+pos = tblPos == "Top right" ? position.top_right : tblPos == "Bottom right" ? position.bottom_right :
+      tblPos == "Top left" ? position.top_left : position.bottom_left
+var table tbl = table.new(pos, 9, N + 2, bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.gray)
+
+if barstate.islast
+    headers = array.from("Level", "Setups", "Fills", "Fill %", "Wins", "Losses", "Win %", "Total R", "Avg R")
+    for c = 0 to 8
+        table.cell(tbl, c, 0, headers.get(c), text_color = color.white, bgcolor = color.new(color.blue, 40), text_size = size.small)
+    // best level by total R
+    best = 0
+    for i = 1 to N - 1
+        if sumR.get(i) > sumR.get(best)
+            best := i
+    for i = 0 to N - 1
+        f  = fills.get(i)
+        w  = wins.get(i)
+        l  = losses.get(i)
+        closed = w + l
+        fillPct = setups > 0 ? 100.0 * f / setups : 0.0
+        winPct  = closed > 0 ? 100.0 * w / closed : 0.0
+        avgR    = closed > 0 ? sumR.get(i) / closed : 0.0
+        rowBg   = i == best and sumR.get(i) > 0 ? color.new(color.green, 60) : na
+        tc      = color.white
+        r = i + 1
+        table.cell(tbl, 0, r, str.tostring(levels.get(i) * 100, "#.#") + "%", text_color = tc, bgcolor = rowBg, text_size = size.small)
+        table.cell(tbl, 1, r, str.tostring(setups), text_color = tc, bgcolor = rowBg, text_size = size.small)
+        table.cell(tbl, 2, r, str.tostring(f), text_color = tc, bgcolor = rowBg, text_size = size.small)
+        table.cell(tbl, 3, r, str.tostring(fillPct, "#.#") + "%", text_color = tc, bgcolor = rowBg, text_size = size.small)
+        table.cell(tbl, 4, r, str.tostring(w), text_color = tc, bgcolor = rowBg, text_size = size.small)
+        table.cell(tbl, 5, r, str.tostring(l), text_color = tc, bgcolor = rowBg, text_size = size.small)
+        table.cell(tbl, 6, r, str.tostring(winPct, "#.#") + "%", text_color = tc, bgcolor = rowBg, text_size = size.small)
+        table.cell(tbl, 7, r, str.tostring(sumR.get(i), "#.##"), text_color = sumR.get(i) >= 0 ? color.lime : color.red, bgcolor = rowBg, text_size = size.small)
+        table.cell(tbl, 8, r, str.tostring(avgR, "#.##"), text_color = tc, bgcolor = rowBg, text_size = size.small)
+    table.cell(tbl, 0, N + 1, "Stop fib " + str.tostring(stopFib) + " | TP " + (tpMode == "Risk:Reward" ? "1:" + str.tostring(rr) : "swing extreme") + " | EOD exits: " + str.tostring(eods.get(0)) + "/" + str.tostring(eods.get(1)) + "/" + str.tostring(eods.get(2)) + "/" + str.tostring(eods.get(3)),
+         text_color = color.silver, text_size = size.tiny)
+    table.merge_cells(tbl, 0, N + 1, 8, N + 1)
