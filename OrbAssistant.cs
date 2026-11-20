@@ -961,8 +961,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private static DateTime ToZone(DateTime t, TimeZoneInfo tz)
         {
-            return TimeZoneInfo.ConvertTime(DateTime.SpecifyKind(t, DateTimeKind.Unspecified),
-                NinjaTrader.Core.Globals.GeneralOptions.TimeZoneInfo, tz);
+            TimeZoneInfo src = NinjaTrader.Core.Globals.GeneralOptions.TimeZoneInfo;
+            DateTime u = DateTime.SpecifyKind(t, DateTimeKind.Unspecified);
+            // ביום שמזיזים את השעון קדימה יש שעה שלא קיימת, וההמרה נכשלת. מזיזים שעה קדימה.
+            if (src.IsInvalidTime(u))
+                u = u.AddHours(1);
+            return TimeZoneInfo.ConvertTime(u, src, tz);
         }
 
         private static int Hhmm(DateTime t)
