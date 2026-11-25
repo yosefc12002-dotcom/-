@@ -39,7 +39,8 @@ namespace NinjaTrader.NinjaScript.Strategies
     // FixedTicks    = סטופ קבוע במספר טיקים
     // SignalCandle  = סטופ מעבר לקצה של נר הפריצה
     // RangeOpposite = סטופ בצד השני של טווח הפתיחה
-    public enum OrbStopMode { FixedTicks, SignalCandle, RangeOpposite }
+    // RangeMiddle   = סטופ באמצע טווח הפתיחה
+    public enum OrbStopMode { FixedTicks, SignalCandle, RangeOpposite, RangeMiddle }
 
     // TrailingIntraday  = הסף עולה עם כל שיא חדש ביתרה, גם באמצע היום (הכי מחמיר, מתאים לכל הפירמות)
     // TrailingEndOfDay  = הסף עולה רק לפי היתרה בסוף יום
@@ -395,6 +396,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return isLong ? Low[b] - StopOffsetTicks * TickSize : High[b] + StopOffsetTicks * TickSize;
                 case OrbStopMode.RangeOpposite:
                     return isLong ? orLow - StopOffsetTicks * TickSize : orHigh + StopOffsetTicks * TickSize;
+                case OrbStopMode.RangeMiddle:
+                {
+                    double mid = Instrument.MasterInstrument.RoundToTickSize((orHigh + orLow) / 2.0);
+                    return isLong ? mid - StopOffsetTicks * TickSize : mid + StopOffsetTicks * TickSize;
+                }
                 default:
                     return isLong ? Close[b] - StopTicks * TickSize : Close[b] + StopTicks * TickSize;
             }
@@ -1005,7 +1011,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int NewsBufferMinutes { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "סוג סטופ", Description = "FixedTicks = טיקים קבועים, SignalCandle = מעבר לנר הפריצה, RangeOpposite = צד שני של הטווח", Order = 1, GroupName = "2. סטופ ויעד")]
+        [Display(Name = "סוג סטופ", Description = "FixedTicks = טיקים קבועים, SignalCandle = מעבר לנר הפריצה, RangeOpposite = צד שני של הטווח, RangeMiddle = אמצע הטווח", Order = 1, GroupName = "2. סטופ ויעד")]
         public OrbStopMode StopMode { get; set; }
 
         [NinjaScriptProperty]
